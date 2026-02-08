@@ -1,0 +1,318 @@
+version: '3.8'
+
+services:
+  # Registry Service - Central agent registry (FIRST)
+  registry:
+    build:
+      context: .
+      dockerfile: services/registry/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - REGISTRY_HOST=0.0.0.0
+      - REGISTRY_PORT=8000
+      - HEARTBEAT_TIMEOUT=60
+    networks:
+      - a2a-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MCP Registry - MCP server registry (SECOND - parallel with Orchestrator)
+  mcp-registry:
+    build:
+      context: .
+      dockerfile: services/mcp_registry/Dockerfile
+    ports:
+      - "8200:8200"
+    environment:
+      - MCP_REGISTRY_HOST=0.0.0.0
+      - MCP_REGISTRY_PORT=8200
+      - LOG_LEVEL=info
+    depends_on:
+      registry:
+        condition: service_healthy
+    networks:
+      - a2a-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8200/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Orchestrator Service (SECOND - parallel with MCP Registry)
+  orchestrator:
+    build:
+      context: .
+      dockerfile: services/orchestrator/Dockerfile
+    ports:
+      - "8100:8100"
+    environment:
+      - ORCHESTRATOR_NAME=MainOrchestrator
+      - ORCHESTRATOR_PORT=8100
+      - REGISTRY_URL=http://registry:8000
+      # AWS credentials - will use mounted credentials if env vars not set
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_PROFILE=${AWS_PROFILE:-default}
+      - BEDROCK_MODEL_ID=${BEDROCK_MODEL_ID:-anthropic.claude-3-5-sonnet-20241022-v2:0}
+    volumes:
+      # Mount AWS credentials from host (optional - for local development)
+      - ${HOME}/.aws:/root/.aws:ro
+    depends_on:
+      registry:
+        condition: service_healthy
+    networks:
+      - a2a-network
+
+  # MCP Servers (THIRD - after MCP Registry)
+  
+  # Calculator MCP Server
+  calculator-server:
+    build:
+      context: .
+      dockerfile: services/mcp_servers/calculator/Dockerfile
+    ports:
+      - "8213:8213"
+    environment:
+      - MCP_SERVER_NAME=CalculatorServer
+      - MCP_SERVER_PORT=8213
+      - MCP_REGISTRY_URL=http://mcp-registry:8200
+    depends_on:
+      mcp-registry:
+        condition: service_healthy
+    networks:
+      - a2a-network
+
+  # Database MCP Server
+  database-server:
+    build:
+      context: .
+      dockerfile: services/mcp_servers/database/Dockerfile
+    ports:
+      - "8211:8211"
+    environment:
+      - MCP_SERVER_NAME=DatabaseQueryServer
+      - MCP_SERVER_PORT=8211
+      - MCP_REGISTRY_URL=http://mcp-registry:8200
+      - DATABASE_PATH=/tmp/mcp_database.db
+    depends_on:
+      mcp-registry:
+        condition: service_healthy
+    networks:
+      - a2a-network
+    volumes:
+      - database-data:/tmp
+
+  # File Operations MCP Server
+  file-ops-server:
+    build:
+      context: .
+      dockerfile: services/mcp_servers/file_ops/Dockerfile
+    ports:
+      - "8210:8210"
+    environment:
+      - MCP_SERVER_NAME=FileOperationsServer
+      - MCP_SERVER_PORT=8210
+      - MCP_REGISTRY_URL=http://mcp-registry:8200
+      - WORKSPACE_PATH=/tmp/mcp_workspace
+    depends_on:
+      mcp-registry:
+        condition: service_healthy
+    networks:
+      - a2a-network
+    volumes:
+      - workspace-data:/tmp/mcp_workspace
+
+  # Web Search MCP Server
+  web-search-server:
+    build:
+      context: .
+      dockerfile: services/mcp_servers/web_search/Dockerfile
+    ports:
+      - "8212:8212"
+    environment:
+      - MCP_SERVER_NAME=WebSearchServer
+      - MCP_SERVER_PORT=8212
+      - MCP_REGISTRY_URL=http://mcp-registry:8200
+    depends_on:
+      mcp-registry:
+        condition: service_healthy
+    networks:
+      - a2a-network
+
+  # MCP Gateway (FOURTH - after all MCP Servers)
+  mcp-gateway:
+    build:
+      context: .
+      dockerfile: services/mcp_gateway/Dockerfile
+    ports:
+      - "8300:8300"
+    environment:
+      - MCP_GATEWAY_HOST=0.0.0.0
+      - MCP_GATEWAY_PORT=8300
+      - MCP_REGISTRY_URL=http://mcp-registry:8200
+      # AWS credentials - will use mounted credentials if env vars not set
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_PROFILE=${AWS_PROFILE:-default}
+      - BEDROCK_MODEL_ID=${BEDROCK_MODEL_ID:-anthropic.claude-3-5-sonnet-20241022-v2:0}
+      - LOG_LEVEL=info
+    volumes:
+      # Mount AWS credentials from host (optional - for local development)
+      - ${HOME}/.aws:/root/.aws:ro
+    depends_on:
+      - mcp-registry
+      - calculator-server
+      - database-server
+      - file-ops-server
+      - web-search-server
+    networks:
+      - a2a-network
+
+  # Agent Services (FIFTH - after Registry and MCP Gateway)
+
+  # Code Analyzer Agent
+  code-analyzer:
+    build:
+      context: .
+      dockerfile: services/agents/code_analyzer/Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      - AGENT_NAME=CodeAnalyzer
+      - AGENT_PORT=8001
+      - REGISTRY_URL=http://registry:8000
+      # AWS credentials - will use mounted credentials if env vars not set
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_PROFILE=${AWS_PROFILE:-default}
+      - BEDROCK_MODEL_ID=${BEDROCK_MODEL_ID:-anthropic.claude-3-5-sonnet-20241022-v2:0}
+    volumes:
+      # Mount AWS credentials from host (optional - for local development)
+      - ${HOME}/.aws:/root/.aws:ro
+    depends_on:
+      registry:
+        condition: service_healthy
+    networks:
+      - a2a-network
+
+  # Data Processor Agent
+  data-processor:
+    build:
+      context: .
+      dockerfile: services/agents/data_processor/Dockerfile
+    ports:
+      - "8002:8002"
+    environment:
+      - AGENT_NAME=DataProcessor
+      - AGENT_PORT=8002
+      - REGISTRY_URL=http://registry:8000
+      # AWS credentials - will use mounted credentials if env vars not set
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_PROFILE=${AWS_PROFILE:-default}
+      - BEDROCK_MODEL_ID=${BEDROCK_MODEL_ID:-anthropic.claude-3-5-sonnet-20241022-v2:0}
+    volumes:
+      # Mount AWS credentials from host (optional - for local development)
+      - ${HOME}/.aws:/root/.aws:ro
+    depends_on:
+      registry:
+        condition: service_healthy
+    networks:
+      - a2a-network
+
+  # Research Agent
+  research-agent:
+    build:
+      context: .
+      dockerfile: services/agents/research_agent/Dockerfile
+    ports:
+      - "8003:8003"
+    environment:
+      - AGENT_NAME=ResearchAgent
+      - AGENT_PORT=8003
+      - REGISTRY_URL=http://registry:8000
+      # AWS credentials - will use mounted credentials if env vars not set
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_PROFILE=${AWS_PROFILE:-default}
+      - BEDROCK_MODEL_ID=${BEDROCK_MODEL_ID:-anthropic.claude-3-5-sonnet-20241022-v2:0}
+    volumes:
+      # Mount AWS credentials from host (optional - for local development)
+      - ${HOME}/.aws:/root/.aws:ro
+    depends_on:
+      registry:
+        condition: service_healthy
+    networks:
+      - a2a-network
+
+  # Task Executor Agent
+  task-executor:
+    build:
+      context: .
+      dockerfile: services/agents/task_executor/Dockerfile
+    ports:
+      - "8004:8004"
+    environment:
+      - AGENT_NAME=TaskExecutor
+      - AGENT_PORT=8004
+      - REGISTRY_URL=http://registry:8000
+    depends_on:
+      registry:
+        condition: service_healthy
+    networks:
+      - a2a-network
+
+  # Observer Agent
+  observer:
+    build:
+      context: .
+      dockerfile: services/agents/observer/Dockerfile
+    ports:
+      - "8005:8005"
+    environment:
+      - AGENT_NAME=Observer
+      - AGENT_PORT=8005
+      - REGISTRY_URL=http://registry:8000
+    depends_on:
+      registry:
+        condition: service_healthy
+    networks:
+      - a2a-network
+
+  # Math Agent (uses MCP Gateway)
+  math-agent:
+    build:
+      context: .
+      dockerfile: services/agents/math_agent/Dockerfile
+    ports:
+      - "8006:8006"
+    environment:
+      - AGENT_NAME=MathAgent
+      - AGENT_PORT=8006
+      - REGISTRY_URL=http://registry:8000
+      - MCP_GATEWAY_URL=http://mcp-gateway:8300
+      - LOG_LEVEL=INFO
+    depends_on:
+      registry:
+        condition: service_healthy
+      mcp-gateway:
+        condition: service_started
+    networks:
+      - a2a-network
+
+networks:
+  a2a-network:
+    driver: bridge
+
+volumes:
+  database-data:
+  workspace-data:

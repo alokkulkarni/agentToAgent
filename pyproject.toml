@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "a2a-agent-system"
+version = "0.1.0"
+description = "Agent-to-Agent Protocol Implementation with AWS Bedrock Orchestrator"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    {name = "Alok Kulkarni", email = "alok@example.com"}
+]
+dependencies = [
+    "pydantic>=2.10.5",
+    "pydantic-settings>=2.7.1",
+    "boto3>=1.35.94",
+    "aioboto3>=13.3.0",
+    "python-dotenv>=1.0.1",
+    "structlog>=24.4.0",
+    "colorama>=0.4.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.14.0",
+    "pytest>=8.3.4",
+    "pytest-asyncio>=0.25.2",
+    "pytest-cov>=6.0.0",
+    "black>=24.10.0",
+    "ruff>=0.8.4",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+
+[tool.black]
+line-length = 100
+target-version = ['py311']
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
