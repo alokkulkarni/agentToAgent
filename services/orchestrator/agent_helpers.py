@@ -4,7 +4,7 @@ Helper utilities for agents to request user input and maintain context
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
-from .models import InputType
+from models import InputType
 
 
 class AgentInteractionHelper:

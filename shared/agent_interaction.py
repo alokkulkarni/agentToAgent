@@ -39,12 +39,15 @@ class AgentInteractionHelper:
             task_request: The task request dict from orchestrator
         """
         self.task_request = task_request
-        self.workflow_id = task_request.get("workflow_id")
-        self.step_id = task_request.get("step_id")
-        self.agent_name = task_request.get("agent_name")
         
         # Extract context from task request
         self.context = task_request.get("context", {})
+        
+        # Try to get workflow_id, step_id, agent_name from direct params or context
+        self.workflow_id = task_request.get("workflow_id") or self.context.get("workflow_id")
+        self.step_id = task_request.get("step_id") or self.context.get("step_id") or f"step_{self.context.get('step_number', 0)}"
+        self.agent_name = task_request.get("agent_name") or self.context.get("agent_name")
+        
         self.conversation_history = self.context.get("conversation_history", [])
         self.thought_trail = self.context.get("thought_trail", [])
         self.previous_results = self.context.get("previous_step_results", {})

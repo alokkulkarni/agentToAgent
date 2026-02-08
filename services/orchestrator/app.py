@@ -7,6 +7,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from typing import Dict, Any, List
 import asyncio
@@ -14,12 +15,14 @@ import json
 from datetime import datetime
 import boto3
 from dotenv import load_dotenv
+import uuid
 
 from shared.a2a_protocol import (
     AgentMetadata, AgentRole, AgentCapability,
     TaskRequest, TaskResponse, TaskStatus,
     A2AClient
 )
+from models import WorkflowRecord, WorkflowStatus
 
 load_dotenv()
 
@@ -313,10 +316,31 @@ def init_bedrock():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle management"""
+    global db, interaction_mgr, executor
+    
     print("Starting Orchestrator Service...")
+    
+    # Initialize database and managers
+    from database import WorkflowDatabase
+    from interaction import InteractionManager
+    from executor import WorkflowExecutor
+    
+    db = WorkflowDatabase()
+    interaction_mgr = InteractionManager(db)
+    executor = WorkflowExecutor(db, interaction_mgr)
+    print("✓ Database and managers initialized")
+    
+    # Initialize Bedrock
     init_bedrock()
+    
+    # Register with registry
     await register_with_registry()
+    
+    # Initialize WebSocket handler
+    init_websocket_handler()
+    
     yield
+    
     print("Shutting down Orchestrator Service...")
     if registry_client and orchestrator_id:
         await registry_client.unregister_agent(orchestrator_id)
@@ -330,31 +354,47 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# Add CORS middleware for WebSocket connections
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify actual origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Initialize WebSocket handler (will be set up after managers are available)
+# Global state
+registry_client: A2AClient = None
+orchestrator_id: str = None
+bedrock_runtime = None
+
+# Global managers (initialized in lifespan)
+db = None
+interaction_mgr = None
+executor = None
 ws_handler = None
 
 
 def init_websocket_handler():
     """Initialize WebSocket handler with database and managers"""
-    global ws_handler
+    global ws_handler, db, interaction_mgr, executor
     from websocket_handler import WebSocketMessageHandler
-    from database import WorkflowDatabase
-    from interaction import InteractionManager
-    from executor import WorkflowExecutor
     
-    db = WorkflowDatabase()
-    interaction_mgr = InteractionManager(db)
-    executor = WorkflowExecutor(db, interaction_mgr)
+    # Use the global instances created during lifespan startup
+    if not db:
+        print("⚠️  Warning: Database not initialized yet")
+        return
+    if not interaction_mgr:
+        print("⚠️  Warning: Interaction manager not initialized yet")
+        return
+    if not executor:
+        print("⚠️  Warning: Executor not initialized yet")
+        return
     
     ws_handler = WebSocketMessageHandler(db, interaction_mgr, executor)
     print("✓ WebSocket handler initialized")
 
-
-# Initialize on startup (after lifespan startup)
-@app.on_event("startup")
-async def startup_event():
-    """Additional startup tasks"""
-    init_websocket_handler()
 
 
 @app.get("/")
@@ -383,7 +423,58 @@ async def execute_workflow(request: Dict[str, Any]):
         raise HTTPException(status_code=400, detail="task_description required")
     
     workflow_id = request.get("workflow_id", str(datetime.utcnow().timestamp()))
+    async_mode = request.get("async", False)  # Support async execution
     
+    # Register workflow immediately in both memory and DB
+    workflow_state = {
+        "workflow_id": workflow_id,
+        "status": "initializing",
+        "task_description": task_description,
+        "start_time": datetime.utcnow().isoformat(),
+        "results": [],
+        "completed_steps": []
+    }
+    
+    if workflow_id not in active_workflows:
+        active_workflows[workflow_id] = workflow_state
+        # Also save to DB for WebSocket handler
+        workflow_record = WorkflowRecord(
+            workflow_id=workflow_id,
+            task_description=task_description,
+            status=WorkflowStatus.PLANNING,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow()
+        )
+        db.save_workflow(workflow_record)  # Not async
+    
+    if async_mode:
+        # Run workflow in background task
+        async def run_workflow_with_error_handling():
+            try:
+                await _execute_workflow_internal(workflow_id, task_description)
+            except Exception as e:
+                print(f"❌ Background workflow execution failed: {e}")
+                import traceback
+                traceback.print_exc()
+                # Update workflow status
+                if workflow_id in active_workflows:
+                    active_workflows[workflow_id]["status"] = "failed"
+                    active_workflows[workflow_id]["error"] = str(e)
+        
+        asyncio.create_task(run_workflow_with_error_handling())
+        return {
+            "workflow_id": workflow_id,
+            "status": "started",
+            "message": "Workflow started in background. Connect to WebSocket for updates.",
+            "websocket_url": f"/ws/workflow/{workflow_id}"
+        }
+    else:
+        # Run workflow synchronously (original behavior)
+        return await _execute_workflow_internal(workflow_id, task_description)
+
+
+async def _execute_workflow_internal(workflow_id: str, task_description: str):
+    """Internal workflow execution logic"""
     print(f"\n{'='*80}")
     print(f"🚀 WORKFLOW EXECUTION STARTED")
     print(f"{'='*80}")
@@ -475,6 +566,20 @@ async def execute_workflow(request: Dict[str, Any]):
             print(f"      Capability: {capability}")
             print(f"      Initial Parameters: {json.dumps(parameters, indent=10)}")
             
+            # Notify WebSocket clients: step started
+            if ws_handler and ws_handler.connection_manager.has_connections(workflow_id):
+                await ws_handler.connection_manager.broadcast_to_workflow(workflow_id, {
+                    "type": "step_started",
+                    "workflow_id": workflow_id,
+                    "step": {
+                        "step_number": step_num,
+                        "total_steps": len(plan.get('steps', [])),
+                        "capability": capability,
+                        "description": description
+                    },
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+            
             # Find agent for capability
             if capability not in capabilities:
                 print(f"      ❌ No agent found for capability: {capability}")
@@ -509,6 +614,8 @@ async def execute_workflow(request: Dict[str, Any]):
                 context={
                     "workflow_id": workflow_id,
                     "step_number": step_num,
+                    "step_id": f"step_{step_num}",
+                    "agent_name": agent_name,
                     "total_steps": len(plan.get('steps', [])),
                     "workflow_context": workflow_context
                 }
@@ -519,8 +626,101 @@ async def execute_workflow(request: Dict[str, Any]):
                 print(f"      🔄 Sending task to {agent_name}...")
                 response = await registry_client.send_task(agent_endpoint, task)
                 
+                # Check if agent is requesting user input
+                if (response.status == TaskStatus.COMPLETED and 
+                    isinstance(response.result, dict) and 
+                    response.result.get("status") == "user_input_required"):
+                    
+                    interaction_req = response.result.get("interaction_request", {})
+                    
+                    print(f"      ⏸️  Step {step_num} PAUSED - Awaiting user input")
+                    print(f"      Question: {interaction_req.get('question', 'N/A')}")
+                    
+                    # Determine input type
+                    from models import InputType
+                    input_type_str = interaction_req.get("input_type", "text")
+                    if input_type_str == "single_choice":
+                        input_type = InputType.SINGLE_CHOICE
+                    elif input_type_str == "multiple_choice":
+                        input_type = InputType.MULTIPLE_CHOICE
+                    elif input_type_str == "confirmation":
+                        input_type = InputType.CONFIRMATION
+                    else:
+                        input_type = InputType.TEXT
+                    
+                    # Create interaction request via interaction manager
+                    # Merge agent context with orchestrator context
+                    merged_context = {"capability": capability, "step": step_num}
+                    agent_context = interaction_req.get("context", {})
+                    if isinstance(agent_context, dict):
+                        merged_context.update(agent_context)
+                    
+                    # Extract and validate reasoning field
+                    reasoning = interaction_req.get("reasoning", "")
+                    if not isinstance(reasoning, str):
+                        reasoning = str(reasoning) if reasoning else ""
+                    
+                    interaction_request = await interaction_mgr.request_user_input(
+                        workflow_id=workflow_id,
+                        step_id=f"step_{step_num}",
+                        agent_name=agent_name,
+                        question=interaction_req.get("question", "Additional input needed"),
+                        input_type=input_type,
+                        options=interaction_req.get("options"),
+                        context=merged_context,
+                        reasoning=reasoning
+                    )
+                    
+                    # Create interaction object matching HTML client expectations
+                    interaction = {
+                        "request_id": interaction_request.request_id,
+                        "workflow_id": workflow_id,
+                        "step_number": step_num,
+                        "agent": agent_name,
+                        "capability": capability,
+                        "question": interaction_request.question,
+                        "reasoning": interaction_request.reasoning or "",
+                        "input_type": input_type_str,
+                        "options": interaction_request.options,
+                        "placeholder": interaction_req.get("placeholder", "Enter your response...")
+                    }
+                    
+                    # Save workflow state to database
+                    await db.save_workflow(workflow_id, {
+                        "status": "waiting_for_input",
+                        "current_step": step_num,
+                        "plan": plan,
+                        "workflow_context": workflow_context,
+                        "workflow_state": workflow_state,
+                        "pending_interaction": interaction,
+                        "agent_endpoint": agent_endpoint,
+                        "agent_name": agent_name,
+                        "original_task": task
+                    })
+                    
+                    # Notify WebSocket clients: user input needed
+                    if ws_handler and ws_handler.connection_manager.has_connections(workflow_id):
+                        await ws_handler.connection_manager.broadcast_to_workflow(workflow_id, {
+                            "type": "user_input_required",
+                            "workflow_id": workflow_id,
+                            "interaction": interaction,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                    
+                    # Return immediately - workflow will be resumed when user responds
+                    return {
+                        "workflow_id": workflow_id,
+                        "status": "waiting_for_input",
+                        "request_id": interaction_request.request_id,
+                        "message": "Workflow paused - awaiting user input",
+                        "interaction": interaction,
+                        "steps_completed": len(workflow_state["completed_steps"]),
+                        "current_step": step_num,
+                        "total_steps": len(plan.get('steps', []))
+                    }
+                
                 # PHASE 4: VERIFY - Verify step execution
-                if response.status == TaskStatus.COMPLETED:
+                elif response.status == TaskStatus.COMPLETED:
                     workflow_state["completed_steps"].append(step_num)
                     
                     result_data = {
@@ -551,6 +751,22 @@ async def execute_workflow(request: Dict[str, Any]):
                         "capability": capability,
                         "result_preview": str(response.result)[:100]
                     })
+                    
+                    # Notify WebSocket clients: step completed
+                    if ws_handler and ws_handler.connection_manager.has_connections(workflow_id):
+                        await ws_handler.connection_manager.broadcast_to_workflow(workflow_id, {
+                            "type": "step_completed",
+                            "workflow_id": workflow_id,
+                            "step": {
+                                "step_number": step_num,
+                                "capability": capability,
+                                "description": description,
+                                "agent": agent_name,
+                                "status": "completed"
+                            },
+                            "result": response.result,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
                 else:
                     print(f"      ❌ Step {step_num} VERIFICATION FAILED: {response.error}")
                     execution_log.append({
@@ -559,6 +775,20 @@ async def execute_workflow(request: Dict[str, Any]):
                         "status": "failed",
                         "error": response.error
                     })
+                    
+                    # Notify WebSocket clients: step failed
+                    if ws_handler and ws_handler.connection_manager.has_connections(workflow_id):
+                        await ws_handler.connection_manager.broadcast_to_workflow(workflow_id, {
+                            "type": "step_failed",
+                            "workflow_id": workflow_id,
+                            "step": {
+                                "step_number": step_num,
+                                "capability": capability,
+                                "description": description
+                            },
+                            "error": response.error,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
                     # Continue with remaining steps instead of breaking
                     
             except Exception as e:
@@ -569,6 +799,20 @@ async def execute_workflow(request: Dict[str, Any]):
                     "status": "error",
                     "error": str(e)
                 })
+                
+                # Notify WebSocket clients: step error
+                if ws_handler and ws_handler.connection_manager.has_connections(workflow_id):
+                    await ws_handler.connection_manager.broadcast_to_workflow(workflow_id, {
+                        "type": "step_error",
+                        "workflow_id": workflow_id,
+                        "step": {
+                            "step_number": step_num,
+                            "capability": capability,
+                            "description": description
+                        },
+                        "error": str(e),
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
                 # Continue with remaining steps
         
         # PHASE 5: REFLECT - Analyze execution and results
@@ -598,7 +842,7 @@ async def execute_workflow(request: Dict[str, Any]):
         print(f"Success rate: {reflection.get('success_rate', 'N/A')}")
         print()
         
-        return {
+        result = {
             "workflow_id": workflow_id,
             "status": "completed",
             "steps_completed": len(workflow_state["completed_steps"]),
@@ -609,6 +853,20 @@ async def execute_workflow(request: Dict[str, Any]):
             "execution_log": execution_log,
             "plan": plan
         }
+        
+        # Notify WebSocket clients: workflow completed
+        if ws_handler and ws_handler.connection_manager.has_connections(workflow_id):
+            await ws_handler.connection_manager.broadcast_to_workflow(workflow_id, {
+                "type": "workflow_completed",
+                "workflow_id": workflow_id,
+                "status": "completed",
+                "steps_completed": len(workflow_state["completed_steps"]),
+                "total_steps": len(plan.get("steps", [])),
+                "result": result,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+        
+        return result
         
     except Exception as e:
         print(f"\n❌ WORKFLOW EXECUTION FAILED: {str(e)}")

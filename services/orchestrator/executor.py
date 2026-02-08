@@ -6,7 +6,7 @@ from typing import List, Dict, Set, Any, Optional
 from datetime import datetime
 import logging
 
-from .models import StepRecord, StepStatus, WorkflowConfig
+from models import StepRecord, StepStatus, WorkflowConfig
 
 logger = logging.getLogger(__name__)
 
@@ -279,3 +279,51 @@ class DependencyAnalyzer:
                     )
         
         return errors
+
+
+class WorkflowExecutor:
+    """Simple workflow executor for managing workflow lifecycle"""
+    
+    def __init__(self, db, interaction_mgr):
+        """Initialize executor with database and interaction manager"""
+        self.db = db
+        self.interaction_mgr = interaction_mgr
+        logger.info("WorkflowExecutor initialized")
+    
+    async def resume_workflow(self, workflow_id: str) -> Dict[str, Any]:
+        """Resume a paused workflow"""
+        try:
+            workflow = self.db.get_workflow(workflow_id)
+            if not workflow:
+                return {"success": False, "error": "Workflow not found"}
+            
+            logger.info(f"Resuming workflow {workflow_id}")
+            
+            # Update workflow status
+            self.db.update_workflow_status(workflow_id, "running")
+            
+            return {
+                "success": True,
+                "workflow_id": workflow_id,
+                "message": "Workflow resumed successfully"
+            }
+        except Exception as e:
+            logger.error(f"Failed to resume workflow {workflow_id}: {str(e)}")
+            return {"success": False, "error": str(e)}
+    
+    async def cancel_workflow(self, workflow_id: str) -> bool:
+        """Cancel a running workflow"""
+        try:
+            workflow = self.db.get_workflow(workflow_id)
+            if not workflow:
+                return False
+            
+            logger.info(f"Cancelling workflow {workflow_id}")
+            
+            # Update workflow status
+            self.db.update_workflow_status(workflow_id, "cancelled")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Failed to cancel workflow {workflow_id}: {str(e)}")
+            return False

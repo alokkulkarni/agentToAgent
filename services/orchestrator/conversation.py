@@ -5,11 +5,11 @@ from datetime import datetime
 from typing import Dict, List, Any, Optional
 import logging
 
-from .models import (
+from models import (
     WorkflowContext, ConversationMessage, ThoughtTrailEntry,
     MessageRole, MessageType
 )
-from .database import WorkflowDatabase
+from database import WorkflowDatabase
 
 logger = logging.getLogger(__name__)
 

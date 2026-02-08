@@ -6,11 +6,11 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 import logging
 
-from .models import (
+from models import (
     InteractionRequest, InteractionResponse, InputType,
     WorkflowStatus, WorkflowContext, MessageRole, MessageType
 )
-from .database import WorkflowDatabase
+from database import WorkflowDatabase
 
 logger = logging.getLogger(__name__)
 

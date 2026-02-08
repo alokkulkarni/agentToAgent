@@ -8,7 +8,7 @@ from typing import Optional, List, Dict, Any
 from contextlib import contextmanager
 import os
 
-from .models import (
+from models import (
     WorkflowRecord, StepRecord, WorkflowStatus, StepStatus
 )
 
@@ -98,6 +98,9 @@ class WorkflowDatabase:
                 CREATE INDEX IF NOT EXISTS idx_steps_status 
                 ON steps(status)
             """)
+        
+        # Initialize interaction tables
+        self.init_interaction_tables()
     
     def save_workflow(self, workflow: WorkflowRecord):
         """Save or update workflow record"""
@@ -401,7 +404,7 @@ class WorkflowDatabase:
                 ORDER BY timestamp
             """, (workflow_id,))
             
-            from .models import ConversationMessage, MessageRole, MessageType
+            from models import ConversationMessage, MessageRole, MessageType
             messages = []
             for row in cursor.fetchall():
                 messages.append(ConversationMessage(
@@ -460,7 +463,7 @@ class WorkflowDatabase:
             if not row:
                 return None
             
-            from .models import InteractionRequest, InputType
+            from models import InteractionRequest, InputType
             return InteractionRequest(
                 request_id=row['request_id'],
                 workflow_id=row['workflow_id'],
@@ -479,7 +482,7 @@ class WorkflowDatabase:
                 response_received_at=datetime.fromisoformat(row['response_received_at']) if row['response_received_at'] else None,
                 response_metadata=json.loads(row['response_metadata']) if row['response_metadata'] else {},
                 status=row['status']
-            ))
+            )
     
     def get_pending_interaction(self, workflow_id: str) -> Optional['InteractionRequest']:
         """Get pending interaction request for workflow"""
@@ -496,7 +499,7 @@ class WorkflowDatabase:
             if not row:
                 return None
             
-            from .models import InteractionRequest, InputType
+            from models import InteractionRequest, InputType
             return InteractionRequest(
                 request_id=row['request_id'],
                 workflow_id=row['workflow_id'],
@@ -515,7 +518,7 @@ class WorkflowDatabase:
                 response_received_at=datetime.fromisoformat(row['response_received_at']) if row['response_received_at'] else None,
                 response_metadata=json.loads(row['response_metadata']) if row['response_metadata'] else {},
                 status=row['status']
-            ))
+            )
     
     def save_thought(self, workflow_id: str, thought: 'ThoughtTrailEntry'):
         """Save thought trail entry"""
@@ -545,7 +548,7 @@ class WorkflowDatabase:
                 ORDER BY timestamp
             """, (workflow_id,))
             
-            from .models import ThoughtTrailEntry
+            from models import ThoughtTrailEntry
             thoughts = []
             for row in cursor.fetchall():
                 thoughts.append(ThoughtTrailEntry(
@@ -565,7 +568,7 @@ class WorkflowDatabase:
         if not workflow:
             return None
         
-        from .models import WorkflowContext
+        from models import WorkflowContext
         context = WorkflowContext(
             workflow_id=workflow_id,
             original_task=workflow.task_description,

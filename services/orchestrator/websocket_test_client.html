@@ -474,6 +474,7 @@
                 case 'connection_established':
                     addMessage(`✓ Connected to workflow: ${data.workflow_id}`, 'success');
                     document.getElementById('workflowId').value = data.workflow_id;
+                    currentWorkflowId = data.workflow_id;
                     break;
                 
                 case 'workflow_status':
@@ -486,11 +487,34 @@
                     break;
                 
                 case 'step_started':
-                    addMessage(`▶️ Step started: ${data.step.description || data.step.capability}`, 'info');
+                    const startDesc = data.step.description || data.step.capability;
+                    updateWorkflowStatus('running', data.step.step_number - 1, data.step.total_steps);
+                    addMessage(`▶️ Step ${data.step.step_number}/${data.step.total_steps}: ${startDesc}`, 'info');
                     break;
                 
                 case 'step_completed':
-                    addMessage(`✅ Step completed: ${data.step.description || data.step.capability}`, 'success');
+                    const completeDesc = data.step.description || data.step.capability;
+                    updateWorkflowStatus('running', data.step.step_number, data.step.total_steps);
+                    addMessage(`✅ Step ${data.step.step_number} completed: ${completeDesc}`, 'success');
+                    
+                    // Show result preview if available
+                    if (data.result) {
+                        const resultStr = JSON.stringify(data.result);
+                        const preview = resultStr.length > 100 ? resultStr.substring(0, 100) + '...' : resultStr;
+                        addMessage(`   Result: ${preview}`, 'info');
+                    }
+                    break;
+                
+                case 'step_failed':
+                    const failDesc = data.step.description || data.step.capability;
+                    addMessage(`❌ Step ${data.step.step_number} failed: ${failDesc}`, 'error');
+                    addMessage(`   Error: ${data.error}`, 'error');
+                    break;
+                
+                case 'step_error':
+                    const errorDesc = data.step.description || data.step.capability;
+                    addMessage(`❌ Step ${data.step.step_number} error: ${errorDesc}`, 'error');
+                    addMessage(`   Error: ${data.error}`, 'error');
                     break;
                 
                 case 'user_input_required':
@@ -503,11 +527,19 @@
                 
                 case 'workflow_resuming':
                     addMessage(`🔄 Workflow resuming...`, 'info');
+                    updateWorkflowStatus('running', null, null);
                     break;
                 
                 case 'workflow_completed':
-                    addMessage(`🎉 Workflow completed! Status: ${data.status}`, 'success');
-                    updateWorkflowStatus('completed', data.result?.steps_completed, data.result?.total_steps);
+                    addMessage(`🎉 Workflow completed!`, 'success');
+                    const stepsCompleted = data.steps_completed || data.result?.steps_completed || 0;
+                    const totalSteps = data.total_steps || data.result?.total_steps || 0;
+                    updateWorkflowStatus('completed', stepsCompleted, totalSteps);
+                    
+                    // Show summary
+                    if (data.result?.reflection?.summary) {
+                        addMessage(`   Summary: ${data.result.reflection.summary}`, 'info');
+                    }
                     break;
                 
                 case 'error':
