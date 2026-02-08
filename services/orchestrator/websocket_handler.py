@@ -174,17 +174,17 @@ class WebSocketMessageHandler:
         
         # Check for pending interaction
         pending_interaction = None
-        if workflow.get("status") == "waiting_for_input":
+        if workflow.status.value == "waiting_for_input":
             pending_interaction = self.interaction_manager.get_pending_request(workflow_id)
         
         await self.connection_manager.send_to_connection(websocket, {
             "type": "workflow_status",
             "workflow_id": workflow_id,
-            "status": workflow.get("status"),
-            "steps_completed": workflow.get("steps_completed", 0),
-            "total_steps": workflow.get("total_steps", 0),
+            "status": workflow.status.value,
+            "steps_completed": workflow.completed_steps,
+            "total_steps": workflow.total_steps,
             "pending_interaction": pending_interaction,
-            "current_step": workflow.get("current_step"),
+            "current_step": getattr(workflow, "current_step", None),
             "timestamp": datetime.utcnow().isoformat()
         })
     

@@ -263,3 +263,26 @@ class InteractionManager:
             return [request] if request else []
         
         return list(self._pending_interactions.values())
+    
+    def complete_interaction(self, request_id: str):
+        """Mark an interaction as completed"""
+        request = self._pending_interactions.get(request_id) or \
+                  self.db.get_interaction_request(request_id)
+        
+        if request:
+            request.status = "completed"
+            self.db.save_interaction_request(request)
+            
+            if request_id in self._pending_interactions:
+                del self._pending_interactions[request_id]
+            
+            logger.info(f"Interaction completed: {request_id}")
+    
+    def get_pending_requests(self, workflow_id: str) -> list:
+        """Get all pending interaction requests for a workflow (alias for compatibility)"""
+        return self.get_pending_interactions(workflow_id)
+    
+    def get_pending_request(self, workflow_id: str) -> Optional[InteractionRequest]:
+        """Get single pending request for a workflow"""
+        requests = self.get_pending_interactions(workflow_id)
+        return requests[0] if requests else None
