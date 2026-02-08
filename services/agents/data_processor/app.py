@@ -19,6 +19,10 @@ from shared.a2a_protocol import (
     TaskRequest, TaskResponse, TaskStatus,
     A2AClient
 )
+from shared.agent_interaction import (
+    AgentInteractionHelper,
+    is_interaction_request
+)
 
 load_dotenv()
 
@@ -229,18 +233,113 @@ async def transform_data(parameters: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def analyze_data(parameters: Dict[str, Any]) -> Dict[str, Any]:
-    """Analyze data using LLM"""
+    """
+    Analyze data using LLM
+    
+    ENHANCED: Now supports interactive workflow - can ask user for clarification
+    when data issues or ambiguities are detected
+    """
     data = parameters.get("data")
     if not data:
         raise ValueError("data parameter is required")
     
+    # Create interaction helper
+    helper = AgentInteractionHelper(parameters)
+    
     data_str = json.dumps(data, indent=2) if isinstance(data, dict) else str(data)
     
+    # First, do preliminary analysis to detect issues
+    preliminary_prompt = f"""Examine this data and identify:
+1. Data quality issues (missing values, outliers, inconsistencies)
+2. Potential ambiguities in interpretation
+3. Whether additional context is needed for proper analysis
+
+Data:
+{data_str}
+
+Respond with JSON containing:
+- has_issues: boolean
+- issues: list of issues found
+- needs_clarification: boolean
+- clarification_questions: list of questions if clarification needed"""
+    
+    prelim_response = bedrock_client.converse(
+        modelId=BEDROCK_MODEL_ID,
+        messages=[{"role": "user", "content": [{"text": preliminary_prompt}]}],
+        inferenceConfig={"maxTokens": 1000, "temperature": 0.3}
+    )
+    
+    prelim_analysis = prelim_response['output']['message']['content'][0]['text']
+    
+    # Check if data has significant issues or ambiguities
+    has_issues = "has_issues\": true" in prelim_analysis or "has_issues\":true" in prelim_analysis
+    needs_clarification = "needs_clarification\": true" in prelim_analysis or "needs_clarification\":true" in prelim_analysis
+    
+    # INTERACTIVE WORKFLOW: Ask user for clarification if needed
+    if (has_issues or needs_clarification) and not helper.has_user_response():
+        # Extract specific questions (simplified - in production parse JSON properly)
+        return helper.ask_single_choice(
+            question="I've detected some issues with the data. How would you like me to proceed?",
+            options=[
+                "Proceed with analysis despite issues",
+                "Exclude problematic data points and analyze the rest",
+                "Show me the issues first before proceeding",
+                "Provide additional context to help with interpretation"
+            ],
+            reasoning=f"Data quality issues or ambiguities detected: {prelim_analysis[:200]}...",
+            partial_results={"preliminary_analysis": prelim_analysis}
+        )
+    
+    # Check if user provided guidance
+    user_choice = helper.get_user_response()
+    
+    if user_choice:
+        print(f"✓ User chose: {user_choice}")
+        
+        if "Show me the issues" in user_choice:
+            # Return preliminary analysis
+            return {
+                "data": data,
+                "preliminary_analysis": prelim_analysis,
+                "action_taken": "showing_issues",
+                "user_choice": user_choice,
+                "next_step": "Please review and provide further instructions",
+                "llm_usage": {
+                    "input_tokens": prelim_response['usage'].get('inputTokens', 0),
+                    "output_tokens": prelim_response['usage'].get('outputTokens', 0)
+                }
+            }
+        
+        elif "additional context" in user_choice:
+            # Ask for context
+            return helper.ask_text(
+                question="Please provide additional context to help with data interpretation:",
+                reasoning="Additional context will improve analysis accuracy",
+                placeholder="E.g., data source, time period, units of measurement, etc.",
+                partial_results={"preliminary_analysis": prelim_analysis}
+            )
+        
+        elif "Exclude problematic" in user_choice:
+            analysis_instruction = "Exclude any problematic or ambiguous data points and analyze only the clean, reliable data."
+        else:
+            analysis_instruction = "Proceed with analysis, noting any limitations due to data quality issues."
+    else:
+        analysis_instruction = "Analyze the data as-is, noting any data quality concerns."
+    
+    # Additional context from user (if they provided it in a text response)
+    user_context = ""
+    if user_choice and isinstance(user_choice, str) and len(user_choice) > 50:
+        user_context = f"\n\nUser provided context: {user_choice}"
+    
+    # Perform full analysis
     prompt = f"""Analyze this data and provide:
 1. Key patterns and trends
 2. Statistical insights
 3. Anomalies or interesting observations
 4. Actionable recommendations
+
+{analysis_instruction}
+{user_context}
 
 Data:
 {data_str}"""
@@ -256,9 +355,11 @@ Data:
     return {
         "data": data,
         "analysis": analysis,
+        "preliminary_check": prelim_analysis,
+        "user_guidance": user_choice if user_choice else "none",
         "llm_usage": {
-            "input_tokens": response['usage'].get('inputTokens', 0),
-            "output_tokens": response['usage'].get('outputTokens', 0)
+            "input_tokens": prelim_response['usage'].get('inputTokens', 0) + response['usage'].get('inputTokens', 0),
+            "output_tokens": prelim_response['usage'].get('outputTokens', 0) + response['usage'].get('outputTokens', 0)
         }
     }
 

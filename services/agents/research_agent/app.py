@@ -18,6 +18,10 @@ from shared.a2a_protocol import (
     TaskRequest, TaskResponse, TaskStatus,
     A2AClient
 )
+from shared.agent_interaction import (
+    AgentInteractionHelper,
+    is_interaction_request
+)
 
 load_dotenv()
 
@@ -237,15 +241,94 @@ async def answer_question(parameters: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def generate_report(parameters: Dict[str, Any]) -> Dict[str, Any]:
-    """Generate a detailed report"""
+    """
+    Generate a detailed report
+    
+    ENHANCED: Now supports interactive workflow - can ask user to narrow scope
+    when topic is too broad
+    """
     topic = parameters.get("topic")
     if not topic:
         raise ValueError("topic parameter is required")
     
+    # Create interaction helper
+    helper = AgentInteractionHelper(parameters)
+    
     aspects = parameters.get("aspects", [])
     aspects_str = ", ".join(aspects) if aspects else "all relevant aspects"
     
+    # First, assess the scope of the topic
+    scope_prompt = f"""Analyze this research topic and determine:
+1. Is it too broad for a single comprehensive report?
+2. What are the main sub-topics or aspects?
+3. How many sources/perspectives would be needed?
+
+Topic: {topic}
+
+Respond with JSON containing:
+- is_broad: boolean
+- sub_topics: list of main sub-topics
+- estimated_depth: "shallow", "medium", or "deep"
+- recommendation: suggested focus area if too broad"""
+    
+    scope_response = bedrock_client.converse(
+        modelId=BEDROCK_MODEL_ID,
+        messages=[{"role": "user", "content": [{"text": scope_prompt}]}],
+        inferenceConfig={"maxTokens": 1000, "temperature": 0.3}
+    )
+    
+    scope_analysis = scope_response['output']['message']['content'][0]['text']
+    
+    # Check if topic is too broad
+    is_broad = "is_broad\": true" in scope_analysis or "is_broad\":true" in scope_analysis
+    
+    # INTERACTIVE WORKFLOW: Ask user to narrow scope if topic is too broad
+    if is_broad and not helper.has_user_response():
+        # Try to extract sub-topics (simplified)
+        import re
+        subtopics_match = re.search(r'"sub_topics":\s*\[(.*?)\]', scope_analysis, re.DOTALL)
+        subtopics = []
+        if subtopics_match:
+            # Extract quoted strings
+            subtopics = re.findall(r'"([^"]+)"', subtopics_match.group(1))
+        
+        if subtopics and len(subtopics) > 1:
+            # Offer specific sub-topics
+            options = subtopics[:5] + ["Cover all aspects (comprehensive report)"]
+        else:
+            # Generic options
+            options = [
+                "Focus on current trends and developments",
+                "Focus on historical context and evolution",
+                "Focus on practical applications and use cases",
+                "Focus on challenges and future outlook",
+                "Cover all aspects (comprehensive report)"
+            ]
+        
+        return helper.ask_single_choice(
+            question=f"The topic '{topic}' is quite broad. Which aspect should I focus on?",
+            options=options,
+            reasoning=f"Broad topic detected. Focusing on a specific aspect will produce a more detailed and useful report. Scope analysis: {scope_analysis[:200]}...",
+            partial_results={"scope_analysis": scope_analysis}
+        )
+    
+    # Check if user provided guidance
+    user_choice = helper.get_user_response()
+    
+    if user_choice:
+        print(f"✓ User chose to focus on: {user_choice}")
+        
+        if "Cover all aspects" in user_choice:
+            focus_instruction = "Cover all major aspects comprehensively."
+        else:
+            focus_instruction = f"Focus specifically on: {user_choice}. Provide in-depth coverage of this aspect."
+    else:
+        focus_instruction = "Cover the topic comprehensively."
+    
+    # Generate the report with user's focus
     prompt = f"""Generate a comprehensive report on: {topic}
+
+{focus_instruction}
 
 Include {aspects_str}.
 
@@ -268,9 +351,11 @@ Make it detailed and well-researched."""
     return {
         "topic": topic,
         "report": report,
+        "focus_area": user_choice if user_choice else "comprehensive",
+        "scope_analysis": scope_analysis,
         "llm_usage": {
-            "input_tokens": response['usage'].get('inputTokens', 0),
-            "output_tokens": response['usage'].get('outputTokens', 0)
+            "input_tokens": scope_response['usage'].get('inputTokens', 0) + response['usage'].get('inputTokens', 0),
+            "output_tokens": scope_response['usage'].get('outputTokens', 0) + response['usage'].get('outputTokens', 0)
         }
     }
 

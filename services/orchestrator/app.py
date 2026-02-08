@@ -6,7 +6,7 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from contextlib import asynccontextmanager
 from typing import Dict, Any, List
 import asyncio
@@ -329,6 +329,32 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+# Initialize WebSocket handler (will be set up after managers are available)
+ws_handler = None
+
+
+def init_websocket_handler():
+    """Initialize WebSocket handler with database and managers"""
+    global ws_handler
+    from websocket_handler import WebSocketMessageHandler
+    from database import WorkflowDatabase
+    from interaction import InteractionManager
+    from executor import WorkflowExecutor
+    
+    db = WorkflowDatabase()
+    interaction_mgr = InteractionManager(db)
+    executor = WorkflowExecutor(db, interaction_mgr)
+    
+    ws_handler = WebSocketMessageHandler(db, interaction_mgr, executor)
+    print("✓ WebSocket handler initialized")
+
+
+# Initialize on startup (after lifespan startup)
+@app.on_event("startup")
+async def startup_event():
+    """Additional startup tasks"""
+    init_websocket_handler()
 
 
 @app.get("/")
@@ -1069,6 +1095,114 @@ async def list_agents():
             }
             for agent in agents
         ]
+    }
+
+
+@app.websocket("/ws/workflow/{workflow_id}")
+async def websocket_endpoint(websocket: WebSocket, workflow_id: str):
+    """
+    WebSocket endpoint for real-time workflow interaction
+    
+    Enables bidirectional communication:
+    - Client receives real-time updates (step progress, interaction requests, etc.)
+    - Client can send responses to interaction requests
+    - Client can query status and conversation history
+    
+    Message types from server:
+    - connection_established: Welcome message
+    - workflow_status: Current workflow state
+    - step_started: A step has started
+    - step_completed: A step has completed
+    - user_input_required: Agent needs user input
+    - response_received: User response acknowledged
+    - workflow_resuming: Workflow is resuming after user input
+    - workflow_completed: Workflow finished
+    - error: Error occurred
+    - pong: Response to ping
+    
+    Message types from client:
+    - ping: Keep-alive
+    - get_status: Request current workflow status
+    - get_conversation: Request conversation history
+    - user_response: Submit response to interaction request
+      {
+        "type": "user_response",
+        "request_id": "req_123",
+        "response": "user's answer",
+        "additional_context": {} (optional)
+      }
+    - cancel_workflow: Cancel workflow execution
+    """
+    if not ws_handler:
+        await websocket.close(code=1011, reason="WebSocket handler not initialized")
+        return
+    
+    await ws_handler.handle_connection(websocket, workflow_id)
+
+
+@app.post("/api/workflow/{workflow_id}/respond")
+async def respond_to_interaction(workflow_id: str, response: Dict[str, Any]):
+    """
+    REST endpoint for responding to interaction requests (alternative to WebSocket)
+    
+    Request body:
+    {
+        "request_id": "req_123",
+        "response": "user's answer",
+        "additional_context": {} (optional)
+    }
+    """
+    if not ws_handler:
+        raise HTTPException(status_code=503, detail="WebSocket handler not initialized")
+    
+    request_id = response.get("request_id")
+    user_response = response.get("response")
+    additional_context = response.get("additional_context")
+    
+    if not request_id or user_response is None:
+        raise HTTPException(status_code=400, detail="request_id and response required")
+    
+    # Submit response
+    success = await ws_handler.interaction_manager.submit_response(
+        request_id=request_id,
+        response=user_response,
+        additional_context=additional_context
+    )
+    
+    if not success:
+        raise HTTPException(status_code=400, detail="Failed to submit response")
+    
+    # Notify via WebSocket if connected
+    if ws_handler.connection_manager.has_connections(workflow_id):
+        await ws_handler.connection_manager.broadcast_to_workflow(workflow_id, {
+            "type": "response_received",
+            "request_id": request_id,
+            "response": user_response,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    
+    # Resume workflow
+    asyncio.create_task(ws_handler._resume_workflow(workflow_id))
+    
+    return {
+        "success": True,
+        "message": "Response submitted, workflow resuming"
+    }
+
+
+@app.get("/api/workflow/{workflow_id}/conversation")
+async def get_conversation(workflow_id: str):
+    """Get conversation history for a workflow"""
+    from conversation import ConversationManager
+    from database import WorkflowDatabase
+    
+    db = WorkflowDatabase()
+    conversation_mgr = ConversationManager(db)
+    history = conversation_mgr.get_conversation_history(workflow_id)
+    
+    return {
+        "workflow_id": workflow_id,
+        "conversation": history
     }
 
 
