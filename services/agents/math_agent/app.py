@@ -18,6 +18,7 @@ from shared.a2a_protocol import (
     TaskRequest, TaskResponse, TaskStatus,
     A2AClient
 )
+from shared.agent_interaction import AgentInteractionHelper
 
 load_dotenv()
 
@@ -141,6 +142,11 @@ async def execute_task(task: TaskRequest) -> TaskResponse:
         capability = task.capability
         parameters = task.parameters
         
+        # Inject context into parameters to ensure AgentInteractionHelper works correctly
+        if task.context:
+            task.parameters["context"] = task.context
+            parameters = task.parameters
+        
         if capability == "calculate":
             result = await handle_calculate(parameters)
         elif capability == "advanced_math":
@@ -174,12 +180,50 @@ async def execute_task(task: TaskRequest) -> TaskResponse:
 
 async def handle_calculate(params: Dict[str, Any]) -> Dict[str, Any]:
     """Handle basic calculations using MCP Gateway"""
+    # Create interaction helper
+    helper = AgentInteractionHelper(params)
+    
     operation = params.get("operation")
     a = params.get("a")
     b = params.get("b")
     
-    if not operation or a is None or b is None:
-        raise ValueError("operation, a, and b are required")
+    # Check for user response if we asked for missing input previously
+    if helper.has_user_response():
+        user_response = helper.get_user_response()
+        # Try to parse the missing value from user response
+        # This is a simple implementation - in production use LLM or robust parsing
+        try:
+            # If we were missing 'b', try to parse 'b'
+            if b is None and a is not None and user_response:
+                b = float(user_response)
+            # If we were missing 'a', try to parse 'a'
+            elif a is None and user_response:
+                a = float(user_response)
+            # If we were missing 'operation', use response
+            elif not operation and user_response:
+                operation = user_response.lower()
+        except ValueError:
+            pass # Could not parse, will ask again or fail
+            
+    # INTERACTIVE: Ask for missing parameters
+    if a is None:
+        return helper.ask_text(
+            question="Please provide the first number (a) for the calculation:",
+            reasoning="Missing parameter 'a' for calculation."
+        )
+        
+    if b is None:
+        return helper.ask_text(
+            question=f"Please provide the second number (b) to {operation or 'calculate'} with {a}:",
+            reasoning="Missing parameter 'b' for calculation."
+        )
+        
+    if not operation:
+        return helper.ask_single_choice(
+            question=f"What operation would you like to perform on {a} and {b}?",
+            options=["add", "subtract", "multiply", "divide"],
+            reasoning="Missing parameter 'operation'."
+        )
     
     # Map operations to MCP calculator tools
     tool_map = {

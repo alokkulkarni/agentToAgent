@@ -47,12 +47,14 @@ class WorkflowDatabase:
                     status TEXT NOT NULL,
                     total_steps INTEGER DEFAULT 0,
                     completed_steps INTEGER DEFAULT 0,
+                    current_step INTEGER DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     started_at TEXT,
                     completed_at TEXT,
                     error_message TEXT,
                     workflow_context TEXT,
+                    workflow_state TEXT,
                     execution_plan TEXT,
                     results TEXT
                 )
@@ -108,24 +110,58 @@ class WorkflowDatabase:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT OR REPLACE INTO workflows 
-                (workflow_id, task_description, status, total_steps, completed_steps,
+                (workflow_id, task_description, status, total_steps, completed_steps, current_step,
                  created_at, updated_at, started_at, completed_at, error_message,
-                 workflow_context, execution_plan, results)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 workflow_context, workflow_state, execution_plan, results)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 workflow.workflow_id,
                 workflow.task_description,
-                workflow.status.value,
+                workflow.status.value if isinstance(workflow.status, WorkflowStatus) else workflow.status,
                 workflow.total_steps,
                 workflow.completed_steps,
+                workflow.current_step,
                 workflow.created_at.isoformat(),
                 workflow.updated_at.isoformat(),
                 workflow.started_at.isoformat() if workflow.started_at else None,
                 workflow.completed_at.isoformat() if workflow.completed_at else None,
                 workflow.error_message,
                 json.dumps(workflow.workflow_context),
+                json.dumps(workflow.workflow_state),
                 json.dumps(workflow.execution_plan),
                 json.dumps(workflow.results)
+            ))
+    
+    def update_workflow_state(self, workflow_id: str, state_data: Dict[str, Any]):
+        """Update workflow state during execution (for pausing, etc.)"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE workflows 
+                SET status = ?,
+                    workflow_context = ?,
+                    updated_at = ?
+                WHERE workflow_id = ?
+            """, (
+                state_data.get("status", "running"),
+                json.dumps(state_data),
+                datetime.utcnow().isoformat(),
+                workflow_id
+            ))
+    
+    def update_workflow_status(self, workflow_id: str, status: str):
+        """Update workflow status"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE workflows 
+                SET status = ?,
+                    updated_at = ?
+                WHERE workflow_id = ?
+            """, (
+                status,
+                datetime.utcnow().isoformat(),
+                workflow_id
             ))
     
     def get_workflow(self, workflow_id: str) -> Optional[WorkflowRecord]:
@@ -140,18 +176,24 @@ class WorkflowDatabase:
             if not row:
                 return None
             
+            # Handle old rows that might not have current_step or workflow_state
+            current_step = row['current_step'] if 'current_step' in row.keys() else 0
+            workflow_state = row['workflow_state'] if 'workflow_state' in row.keys() else None
+            
             return WorkflowRecord(
                 workflow_id=row['workflow_id'],
                 task_description=row['task_description'],
                 status=WorkflowStatus(row['status']),
                 total_steps=row['total_steps'],
                 completed_steps=row['completed_steps'],
+                current_step=current_step,
                 created_at=datetime.fromisoformat(row['created_at']),
                 updated_at=datetime.fromisoformat(row['updated_at']),
                 started_at=datetime.fromisoformat(row['started_at']) if row['started_at'] else None,
                 completed_at=datetime.fromisoformat(row['completed_at']) if row['completed_at'] else None,
                 error_message=row['error_message'],
                 workflow_context=json.loads(row['workflow_context']) if row['workflow_context'] else {},
+                workflow_state=json.loads(workflow_state) if workflow_state else {},
                 execution_plan=json.loads(row['execution_plan']) if row['execution_plan'] else {},
                 results=json.loads(row['results']) if row['results'] else []
             )
@@ -519,6 +561,55 @@ class WorkflowDatabase:
                 response_metadata=json.loads(row['response_metadata']) if row['response_metadata'] else {},
                 status=row['status']
             )
+    
+    def get_answered_interaction(self, workflow_id: str) -> Optional['InteractionRequest']:
+        """Get answered (but not completed) interaction request for workflow"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM interaction_requests 
+                WHERE workflow_id = ? AND status = 'answered'
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (workflow_id,))
+            row = cursor.fetchone()
+            
+            if not row:
+                return None
+            
+            from models import InteractionRequest, InputType
+            return InteractionRequest(
+                request_id=row['request_id'],
+                workflow_id=row['workflow_id'],
+                step_id=row['step_id'],
+                agent_name=row['agent_name'],
+                created_at=datetime.fromisoformat(row['created_at']),
+                timeout_at=datetime.fromisoformat(row['timeout_at']) if row['timeout_at'] else None,
+                question=row['question'],
+                input_type=InputType(row['input_type']),
+                options=json.loads(row['options']) if row['options'] else None,
+                default_value=json.loads(row['default_value']) if row['default_value'] else None,
+                context=json.loads(row['context']) if row['context'] else {},
+                reasoning=row['reasoning'],
+                partial_results=json.loads(row['partial_results']) if row['partial_results'] else None,
+                response=json.loads(row['response']) if row['response'] else None,
+                response_received_at=datetime.fromisoformat(row['response_received_at']) if row['response_received_at'] else None,
+                response_metadata=json.loads(row['response_metadata']) if row['response_metadata'] else {},
+                status=row['status']
+            )
+    
+    def get_all_interaction_requests(self) -> List[Dict]:
+        """Get all interaction requests for debugging"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT request_id, workflow_id, status, question 
+                FROM interaction_requests 
+                ORDER BY created_at DESC 
+                LIMIT 20
+            """)
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
     
     def save_thought(self, workflow_id: str, thought: 'ThoughtTrailEntry'):
         """Save thought trail entry"""

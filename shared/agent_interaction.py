@@ -200,8 +200,8 @@ class AgentInteractionHelper:
     
     def has_user_response(self) -> bool:
         """Check if user has already responded to a previous interaction"""
-        return len(self.user_responses) > 0
-    
+        return len(self.user_responses) > 0 or "user_input" in self.task_request
+
     def get_user_response(self, index: int = -1) -> Optional[Any]:
         """
         Get user's response from context
@@ -212,14 +212,20 @@ class AgentInteractionHelper:
         Returns:
             User's response value or None
         """
-        if not self.user_responses:
-            return None
+        # Check explicit user responses list first
+        if self.user_responses:
+            try:
+                response = self.user_responses[index]
+                return response.get('content') or response.get('value')
+            except (IndexError, KeyError):
+                pass
         
-        try:
-            response = self.user_responses[index]
-            return response.get('content') or response.get('value')
-        except (IndexError, KeyError):
-            return None
+        # Fallback: Check if user_input is directly in task parameters
+        # This handles cases where agents pass 'parameters' instead of full 'task_request'
+        if "user_input" in self.task_request:
+            return self.task_request.get("user_input")
+            
+        return None
     
     def get_latest_user_message(self) -> Optional[str]:
         """Get the most recent user message from conversation"""

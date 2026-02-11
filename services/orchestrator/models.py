@@ -38,12 +38,14 @@ class WorkflowRecord(BaseModel):
     status: WorkflowStatus
     total_steps: int = 0
     completed_steps: int = 0
+    current_step: int = 0
     created_at: datetime
     updated_at: datetime
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     error_message: Optional[str] = None
     workflow_context: Dict[str, Any] = Field(default_factory=dict)
+    workflow_state: Dict[str, Any] = Field(default_factory=dict)  # Serialized state for resume
     execution_plan: Dict[str, Any] = Field(default_factory=dict)
     results: List[Dict[str, Any]] = Field(default_factory=list)
 

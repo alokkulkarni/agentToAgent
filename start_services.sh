@@ -183,7 +183,7 @@ sleep 3
 # Start Orchestrator Service
 echo -e "${BLUE}Starting Orchestrator Service...${NC}"
 cd "$PROJECT_ROOT/services/orchestrator"
-python app.py &
+python app.py > "$PROJECT_ROOT/logs/orchestrator.log" 2>&1 &
 ORCHESTRATOR_PID=$!
 echo -e "Orchestrator PID: ${GREEN}$ORCHESTRATOR_PID${NC}"
 sleep 2
@@ -244,7 +244,7 @@ echo -e "Code Analyzer PID: ${GREEN}$CODE_ANALYZER_PID${NC}"
 
 # Data Processor
 cd "$PROJECT_ROOT/services/agents/data_processor"
-python app.py &
+python app.py > "$PROJECT_ROOT/logs/data_processor.log" 2>&1 &
 DATA_PROCESSOR_PID=$!
 echo -e "Data Processor PID: ${GREEN}$DATA_PROCESSOR_PID${NC}"
 

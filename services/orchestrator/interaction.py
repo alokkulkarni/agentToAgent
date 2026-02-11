@@ -176,11 +176,17 @@ class InteractionManager:
         Returns:
             True if successful, False otherwise
         """
+        logger.info(f"submit_response called for request_id: {request_id}")
         request = self.db.get_interaction_request(request_id)
         
         if not request:
             logger.error(f"Interaction request not found: {request_id}")
+            # List all pending requests for debugging
+            all_requests = self.db.get_all_interaction_requests()
+            logger.error(f"Available requests: {[r['request_id'] for r in all_requests]}")
             return False
+        
+        logger.info(f"Found request with status: {request.status}")
         
         if request.status != "pending":
             logger.warning(f"Interaction request not pending: {request_id} (status: {request.status})")
@@ -223,6 +229,9 @@ class InteractionManager:
             return isinstance(response, str)
         
         elif request.input_type == InputType.SINGLE_CHOICE:
+            # Allow free text OR one of the options for flexibility
+            if isinstance(response, str):
+                return True
             return request.options and response in request.options
         
         elif request.input_type == InputType.MULTIPLE_CHOICE:
@@ -264,6 +273,10 @@ class InteractionManager:
         
         return list(self._pending_interactions.values())
     
+    async def get_pending_requests(self, workflow_id: str) -> list:
+        """Async wrapper for getting pending interaction requests"""
+        return self.get_pending_interactions(workflow_id)
+    
     def complete_interaction(self, request_id: str):
         """Mark an interaction as completed"""
         request = self._pending_interactions.get(request_id) or \
@@ -286,3 +299,8 @@ class InteractionManager:
         """Get single pending request for a workflow"""
         requests = self.get_pending_interactions(workflow_id)
         return requests[0] if requests else None
+    
+    def get_answered_request(self, workflow_id: str) -> Optional[InteractionRequest]:
+        """Get single answered (but not completed) request for a workflow"""
+        request = self.db.get_answered_interaction(workflow_id)
+        return request

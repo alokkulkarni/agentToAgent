@@ -9,6 +9,8 @@ import json
 from datetime import datetime
 import logging
 
+from models import WorkflowStatus
+
 logger = logging.getLogger(__name__)
 
 
@@ -97,10 +99,11 @@ class ConnectionManager:
 class WebSocketMessageHandler:
     """Handles incoming WebSocket messages and routes them appropriately"""
     
-    def __init__(self, db, interaction_manager, executor):
+    def __init__(self, db, interaction_manager, executor, resume_workflow_func=None):
         self.db = db
         self.interaction_manager = interaction_manager
         self.executor = executor
+        self.resume_workflow_func = resume_workflow_func
         self.connection_manager = ConnectionManager()
     
     async def handle_connection(self, websocket: WebSocket, workflow_id: str):
@@ -237,13 +240,17 @@ class WebSocketMessageHandler:
                 "timestamp": datetime.utcnow().isoformat()
             })
             
-            # Resume execution
-            result = await self.executor.resume_workflow(workflow_id)
+            # Resume execution - use the passed function if available
+            if self.resume_workflow_func:
+                result = await self.resume_workflow_func(workflow_id)
+            else:
+                # Fallback to executor method (though it's not fully functional)
+                result = await self.executor.resume_workflow(workflow_id)
             
             # Broadcast completion or next interaction
             workflow = self.db.get_workflow(workflow_id)
             
-            if workflow.get("status") == "waiting_for_input":
+            if workflow and workflow.status == WorkflowStatus.WAITING_FOR_INPUT:
                 # Another interaction needed
                 pending_interaction = self.interaction_manager.get_pending_request(workflow_id)
                 await self.connection_manager.broadcast_to_workflow(workflow_id, {
@@ -257,13 +264,15 @@ class WebSocketMessageHandler:
                 await self.connection_manager.broadcast_to_workflow(workflow_id, {
                     "type": "workflow_completed",
                     "workflow_id": workflow_id,
-                    "status": workflow.get("status"),
+                    "status": workflow.status.value if workflow else "unknown",
                     "result": result,
                     "timestamp": datetime.utcnow().isoformat()
                 })
         
         except Exception as e:
             logger.error(f"Error resuming workflow {workflow_id}: {e}")
+            import traceback
+            traceback.print_exc()
             await self.connection_manager.broadcast_to_workflow(workflow_id, {
                 "type": "error",
                 "message": f"Error resuming workflow: {str(e)}",

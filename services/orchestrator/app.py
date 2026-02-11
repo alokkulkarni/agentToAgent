@@ -424,7 +424,8 @@ def init_websocket_handler():
         print("⚠️  Warning: Executor not initialized yet")
         return
     
-    ws_handler = WebSocketMessageHandler(db, interaction_mgr, executor)
+    # Pass the resume_workflow function to the handler
+    ws_handler = WebSocketMessageHandler(db, interaction_mgr, executor, resume_workflow_func=resume_workflow)
     print("✓ WebSocket handler initialized")
 
 
@@ -724,7 +725,7 @@ async def _execute_workflow_internal(workflow_id: str, task_description: str):
                     }
                     
                     # Save workflow state to database
-                    await db.save_workflow(workflow_id, {
+                    db.update_workflow_state(workflow_id, {
                         "status": "waiting_for_input",
                         "current_step": step_num,
                         "plan": plan,
@@ -733,7 +734,7 @@ async def _execute_workflow_internal(workflow_id: str, task_description: str):
                         "pending_interaction": interaction,
                         "agent_endpoint": agent_endpoint,
                         "agent_name": agent_name,
-                        "original_task": task
+                        "original_task": task.dict() if hasattr(task, 'dict') else task
                     })
                     
                     # Notify WebSocket clients: user input needed
@@ -749,6 +750,8 @@ async def _execute_workflow_internal(workflow_id: str, task_description: str):
                     workflow_state["paused"] = True
                     workflow_state["pending_interaction"] = interaction
                     workflow_state["pause_step"] = step_num
+                    workflow_state["agent_endpoint"] = agent_endpoint
+                    workflow_state["agent_name"] = agent_name
                     
                     print(f"      ⏸️  Workflow paused at step {step_num}")
                     break  # Exit the loop
@@ -933,27 +936,17 @@ async def resume_workflow(workflow_id: str) -> Dict[str, Any]:
         print(f"\n🔄 RESUMING WORKFLOW: {workflow_id}")
         
         # 1. Load workflow state from database
-        workflow_data = db.get_workflow(workflow_id)
-        if not workflow_data:
+        workflow_record = db.get_workflow(workflow_id)
+        if not workflow_record:
             raise HTTPException(404, "Workflow not found")
         
-        if workflow_data.get("status") != "waiting_for_input":
-            raise HTTPException(400, f"Workflow not paused (status: {workflow_data.get('status')})")
+        if workflow_record.status != WorkflowStatus.WAITING_FOR_INPUT:
+            raise HTTPException(400, f"Workflow not paused (status: {workflow_record.status.value})")
         
-        # 2. Get pending interaction requests with user responses
-        pending_requests = interaction_mgr.get_pending_requests(workflow_id)
-        if not pending_requests:
-            raise HTTPException(400, "No pending interaction requests found")
-        
-        # Find the request with a response
-        interaction_request = None
-        for req in pending_requests:
-            if req.response:
-                interaction_request = req
-                break
-        
+        # 2. Get answered interaction request (user has already responded)
+        interaction_request = interaction_mgr.get_answered_request(workflow_id)
         if not interaction_request:
-            raise HTTPException(400, "No user response provided yet")
+            raise HTTPException(400, "No answered interaction request found for this workflow")
         
         print(f"   User response: {interaction_request.response}")
         
@@ -961,17 +954,63 @@ async def resume_workflow(workflow_id: str) -> Dict[str, Any]:
         interaction_mgr.complete_interaction(interaction_request.request_id)
         
         # 4. Load saved workflow state
-        plan = workflow_data.get("plan", {})
-        workflow_context = workflow_data.get("workflow_context", {})
-        workflow_state = workflow_data.get("workflow_state", {})
-        pause_step = workflow_data.get("current_step", 0)
-        agent_endpoint = workflow_data.get("agent_endpoint")
-        agent_name = workflow_data.get("agent_name")
-        original_task = workflow_data.get("original_task")
+        # The plan is stored in workflow_context, not execution_plan
+        if workflow_record.execution_plan and 'steps' in workflow_record.execution_plan:
+            plan = workflow_record.execution_plan
+        elif workflow_record.workflow_context and 'plan' in workflow_record.workflow_context:
+            plan = workflow_record.workflow_context['plan']
+        else:
+            raise HTTPException(500, "No execution plan found in workflow record")
+        
+        # workflow_record.workflow_context contains the FULL state_data that was saved
+        # We need to extract the ACTUAL workflow_context from inside it
+        saved_state = workflow_record.workflow_context
+        workflow_context = saved_state.get("workflow_context", {})
+        workflow_state = saved_state.get("workflow_state", {})
+        
+        # If workflow_context is still empty, try workflow_record.workflow_state
+        if not workflow_context:
+            workflow_context = {}
+        if not workflow_state and workflow_record.workflow_state:
+            workflow_state = workflow_record.workflow_state
+        
+        # Ensure required context structures exist
+        if "step_results" not in workflow_context:
+            workflow_context["step_results"] = {}
+        if "capability_outputs" not in workflow_context:
+            workflow_context["capability_outputs"] = {}
+        
+        print(f"   📊 Loaded context: {len(workflow_context.get('step_results', {}))} step results, {len(workflow_context.get('capability_outputs', {}))} outputs")
+        
+        # Get the actual pause step from workflow_state
+        pause_step = (workflow_state.get("pause_step") or 
+                     saved_state.get("current_step") or 
+                     workflow_record.current_step)
+        
+        if not pause_step or pause_step == 0:
+            raise HTTPException(500, f"Could not determine paused step (pause_step={pause_step})")
+        
+        # Try to get agent info from multiple locations
+        agent_endpoint = (workflow_state.get("agent_endpoint") or 
+                         saved_state.get("agent_endpoint"))
+        agent_name = (workflow_state.get("agent_name") or 
+                     saved_state.get("agent_name"))
+        
+        if not agent_endpoint or not agent_name:
+            raise HTTPException(500, f"Agent information not found in workflow state (endpoint={agent_endpoint}, name={agent_name})")
+        
+        original_task = workflow_record.task_description
         
         # 5. Inject user response into workflow context
         user_response_key = f"user_response_step_{pause_step}"
         workflow_context[user_response_key] = interaction_request.response
+        
+        # Ensure required context structures exist
+        if "capability_outputs" not in workflow_context:
+            workflow_context["capability_outputs"] = {}
+        if "step_results" not in workflow_context:
+            workflow_context["step_results"] = {}
+            
         workflow_context["capability_outputs"][f"user_input_{pause_step}"] = interaction_request.response
         
         print(f"   ✓ Injected user response into context as '{user_response_key}'")
@@ -1000,6 +1039,17 @@ async def resume_workflow(workflow_id: str) -> Dict[str, Any]:
         print(f"      Enriched Parameters: {json.dumps(enriched_parameters, indent=10)}")
         
         # Create task with user response in context
+        # Build user_responses list for agent's InteractionHelper
+        user_responses_list = [
+            {
+                "content": interaction_request.response,
+                "value": interaction_request.response,
+                "request_id": interaction_request.request_id,
+                "question": interaction_request.question,
+                "step": pause_step
+            }
+        ]
+        
         task = TaskRequest(
             capability=capability,
             parameters=enriched_parameters,
@@ -1010,13 +1060,30 @@ async def resume_workflow(workflow_id: str) -> Dict[str, Any]:
                 "agent_name": agent_name,
                 "total_steps": len(plan['steps']),
                 "workflow_context": workflow_context,
-                "user_response": interaction_request.response,
-                "resuming_from_pause": True
+                "user_response": interaction_request.response,  # Keep for backwards compatibility
+                "user_responses": user_responses_list,  # New format for AgentInteractionHelper
+                "resuming_from_pause": True,
+                "original_task": original_task,
+                "previous_interactions": [
+                    {
+                        "question": interaction_request.question,
+                        "response": interaction_request.response,
+                        "step": pause_step
+                    }
+                ],
+                "previous_step_results": workflow_context.get("step_results", {}),
+                "step_results": workflow_context.get("step_results", {}),
+                "capability_outputs": workflow_context.get("capability_outputs", {})
             }
         )
         
         # 7. Execute the step with user input
         print(f"      🔄 Re-sending task to {agent_name} with user input...")
+        print(f"      📦 Context includes:")
+        print(f"         - Original task: {original_task[:50]}...")
+        print(f"         - User response: {interaction_request.response}")
+        print(f"         - Step results: {list(workflow_context.get('step_results', {}).keys())}")
+        print(f"         - Previous outputs: {list(workflow_context.get('capability_outputs', {}).keys())}")
         response = await registry_client.send_task(agent_endpoint, task)
         
         # 8. Check if it completed or needs more input
@@ -1053,8 +1120,8 @@ async def resume_workflow(workflow_id: str) -> Dict[str, Any]:
             
             # Unpause workflow
             workflow_state["paused"] = False
-            del workflow_state["pending_interaction"]
-            del workflow_state["pause_step"]
+            workflow_state.pop("pending_interaction", None)
+            workflow_state.pop("pause_step", None)
             
             # Notify WebSocket clients
             if ws_handler and ws_handler.connection_manager.has_connections(workflow_id):
@@ -1073,6 +1140,23 @@ async def resume_workflow(workflow_id: str) -> Dict[str, Any]:
             # 9. Continue with remaining steps
             print(f"\n   ▶️  Continuing with remaining steps...")
             
+            # Get agent capabilities once for all remaining steps
+            # TODO: Consider storing agent assignments in workflow_state to avoid registry queries
+            print(f"      🔍 Discovering available agents...")
+            agents = await registry_client.get_all_agents()
+            capabilities = {}
+            for agent in agents:
+                for cap in agent.capabilities:
+                    if cap.name not in capabilities:
+                        capabilities[cap.name] = []
+                    capabilities[cap.name].append({
+                        "agent_id": agent.agent_id,
+                        "agent_name": agent.name,
+                        "endpoint": agent.endpoint,
+                        "description": cap.description
+                    })
+            print(f"      ✓ Found {len(capabilities)} capabilities from {len(agents)} agents")
+            
             remaining_steps = plan['steps'][pause_step:]  # Continue from next step
             
             for step in remaining_steps:
@@ -1090,8 +1174,7 @@ async def resume_workflow(workflow_id: str) -> Dict[str, Any]:
                 print(f"\n   📌 Step {step_num}/{len(plan['steps'])}: {description}")
                 print(f"      Capability: {capability}")
                 
-                # Find agent
-                capabilities = await registry_client.get_agent_capabilities()
+                # Find agent for this capability (using cached capabilities)
                 if capability not in capabilities:
                     print(f"      ❌ No agent found for capability: {capability}")
                     continue
@@ -1171,7 +1254,7 @@ async def resume_workflow(workflow_id: str) -> Dict[str, Any]:
             # Check if workflow paused again or completed
             if workflow_state.get("paused", False):
                 # Save state and return pause status
-                await db.save_workflow(workflow_id, {
+                db.update_workflow_state(workflow_id, {
                     "status": "waiting_for_input",
                     "plan": plan,
                     "workflow_context": workflow_context,
@@ -1194,7 +1277,7 @@ async def resume_workflow(workflow_id: str) -> Dict[str, Any]:
             workflow_state["end_time"] = datetime.utcnow().isoformat()
             
             # Update database
-            await db.save_workflow(workflow_id, {
+            db.update_workflow_state(workflow_id, {
                 "status": "completed",
                 "plan": plan,
                 "workflow_context": workflow_context,
@@ -1310,7 +1393,7 @@ async def _handle_additional_input_request(
     }
     
     # Save workflow state
-    await db.save_workflow(workflow_id, {
+    db.update_workflow_state(workflow_id, {
         "status": "waiting_for_input",
         "current_step": step_num,
         "plan": plan,
@@ -1334,6 +1417,8 @@ async def _handle_additional_input_request(
     workflow_state["paused"] = True
     workflow_state["pending_interaction"] = interaction
     workflow_state["pause_step"] = step_num
+    workflow_state["agent_endpoint"] = agent_endpoint
+    workflow_state["agent_name"] = agent_name
     
     return {
         "workflow_id": workflow_id,
@@ -1889,15 +1974,23 @@ async def respond_to_interaction(workflow_id: str, response: Dict[str, Any]):
     user_response = response.get("response")
     additional_context = response.get("additional_context")
     
+    print(f"\n📨 RECEIVED RESPONSE:")
+    print(f"   Workflow ID: {workflow_id}")
+    print(f"   Request ID: {request_id}")
+    print(f"   Response: {user_response}")
+    
     if not request_id or user_response is None:
         raise HTTPException(status_code=400, detail="request_id and response required")
     
     # Submit response
+    print(f"   Submitting response to interaction manager...")
     success = await ws_handler.interaction_manager.submit_response(
         request_id=request_id,
         response=user_response,
         additional_context=additional_context
     )
+    
+    print(f"   Submit result: {success}")
     
     if not success:
         raise HTTPException(status_code=400, detail="Failed to submit response")
@@ -1917,6 +2010,49 @@ async def respond_to_interaction(workflow_id: str, response: Dict[str, Any]):
     return {
         "success": True,
         "message": "Response submitted, workflow resuming"
+    }
+
+
+@app.get("/api/workflow/{workflow_id}/status")
+async def get_workflow_status(workflow_id: str):
+    """
+    Get the current status of a workflow
+    
+    Returns:
+    {
+        "workflow_id": "...",
+        "status": "running|paused|completed|failed",
+        "current_step": 2,
+        "total_steps": 5,
+        "pending_interactions": [...],
+        "results": [...]
+    }
+    """
+    from database import WorkflowDatabase
+    
+    if not ws_handler:
+        raise HTTPException(status_code=503, detail="WebSocket handler not initialized")
+    
+    # Try to get workflow from database first
+    db = WorkflowDatabase()
+    workflow = db.get_workflow(workflow_id)
+    
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    
+    # Get pending interaction requests
+    pending = ws_handler.interaction_manager.get_pending_requests(workflow_id)
+    
+    return {
+        "workflow_id": workflow_id,
+        "status": workflow.status.value if isinstance(workflow.status, WorkflowStatus) else workflow.status,
+        "current_step": workflow.current_step,
+        "total_steps": workflow.total_steps,
+        "pending_interactions": pending,
+        "results": workflow.results,
+        "start_time": workflow.started_at.isoformat() if workflow.started_at else None,
+        "last_update": workflow.updated_at.isoformat() if workflow.updated_at else None,
+        "workflow_context": workflow.workflow_context
     }
 
 

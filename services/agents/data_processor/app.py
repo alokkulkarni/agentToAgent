@@ -181,6 +181,10 @@ async def execute_task(task: TaskRequest) -> TaskResponse:
     """Execute a task"""
     print(f"Executing task: {task.task_id} - {task.capability}")
     
+    # Inject context into parameters to ensure AgentInteractionHelper works correctly
+    if task.context:
+        task.parameters["context"] = task.context
+    
     from datetime import datetime
     start_time = datetime.utcnow()
     
