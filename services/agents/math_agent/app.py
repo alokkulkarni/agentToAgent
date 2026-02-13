@@ -19,6 +19,7 @@ from shared.a2a_protocol import (
     A2AClient
 )
 from shared.agent_interaction import AgentInteractionHelper
+from shared.audit import AuditLogger
 
 load_dotenv()
 
@@ -31,6 +32,7 @@ MCP_GATEWAY_URL = os.getenv("MCP_GATEWAY_URL", "http://localhost:9000")
 agent_id = None
 agent_metadata = None
 registry_client = None
+audit_logger = AuditLogger()
 
 
 async def register_with_registry():
@@ -141,6 +143,22 @@ async def execute_task(task: TaskRequest) -> TaskResponse:
     try:
         capability = task.capability
         parameters = task.parameters
+        
+        # AUDIT: Log task execution with propagated identity
+        context = task.context or {}
+        user_identity = context.get("user_identity", {"user_id": "unknown", "role": "unknown"})
+        user_id = user_identity.get("user_id")
+        
+        audit_logger.log_event(
+            workflow_id=context.get("workflow_id", "direct_call"),
+            user_id=user_id,
+            event_type="AGENT_EXECUTION",
+            details={
+                "agent": AGENT_NAME,
+                "capability": capability,
+                "parameters": parameters
+            }
+        )
         
         # Inject context into parameters to ensure AgentInteractionHelper works correctly
         if task.context:

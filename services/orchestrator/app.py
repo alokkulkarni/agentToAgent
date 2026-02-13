@@ -9,29 +9,43 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import asyncio
 import json
 from datetime import datetime
 import boto3
 from dotenv import load_dotenv
 import uuid
+from collections import defaultdict
 
 from shared.a2a_protocol import (
     AgentMetadata, AgentRole, AgentCapability,
     TaskRequest, TaskResponse, TaskStatus,
     A2AClient
 )
-from models import WorkflowRecord, WorkflowStatus
+from shared.config import EnterpriseConfig
+from shared.guardrails import GuardrailService
+from shared.audit import AuditLogger
+from shared.security import SecurityManager
+try:
+    from models import WorkflowRecord, WorkflowStatus
+except ImportError:
+    from .models import WorkflowRecord, WorkflowStatus
 
 load_dotenv()
+
+# Initialize Enterprise Services
+guardrails = GuardrailService()
+audit_logger = AuditLogger()
+security_manager = SecurityManager()
 
 
 async def enrich_with_workflow_context(
     capability: str,
     parameters: Dict[str, Any],
     workflow_context: Dict[str, Any],
-    step_description: str
+    step_description: str,
+    session_history: List[Dict] = None
 ) -> Dict[str, Any]:
     """
     Dynamically enrich parameters using accumulated workflow context.
@@ -41,6 +55,25 @@ async def enrich_with_workflow_context(
     step_results = workflow_context.get("step_results", {})
     capability_outputs = workflow_context.get("capability_outputs", {})
     
+    # Pre-append session history to 'context' or 'question' if available
+    # Specifically for ResearchAgent capabilities
+    if session_history and (capability in ['answer_question', 'generate_report', 'research', 'explain_code']):
+        history_context = "\n\n--- PREVIOUS SESSION HISTORY ---\n"
+        for i, entry in enumerate(session_history[-5:]): # Increased to last 5 turns
+             history_context += f"Turn {i+1} Task: {entry['task']}\nTurn {i+1} Result: {str(entry['result'])[:800]}\n\n"
+        
+        # Inject into 'context' parameter if it exists or create it
+        if 'context' in enriched:
+            # Check if it's already a string
+            if isinstance(enriched['context'], str):
+                enriched['context'] = history_context + enriched['context']
+            else:
+                enriched['context'] = history_context
+        else:
+            enriched['context'] = history_context
+            
+        print(f"         ✓ Injected {len(session_history)} session history items into context")
+            
     print(f"      🔗 Context enrichment for '{capability}'...")
     
     # Strategy 0: Generic template replacement for <result_from_step_N> and <output from step N>
@@ -48,8 +81,8 @@ async def enrich_with_workflow_context(
     
     for key, value in list(enriched.items()):
         if isinstance(value, str):
-            # Match <result_from_step_1>, <output from step 2>, etc.
-            pattern = r'<(?:result_from_step_|output from step\s*)(\d+)>'
+            # Match <result_from_step_1>, <output from step 2>, <output_from_step_2>, etc.
+            pattern = r'<(?:result_from_step_|output_from_step_|output from step\s*)(\d+)>'
             match = re.search(pattern, value, re.IGNORECASE)
             
             if match:
@@ -59,22 +92,102 @@ async def enrich_with_workflow_context(
                 if step_key in step_results:
                     result = step_results[step_key]["result"]
                     
+                    # Helper to extract scalar from dict (redefined here for scope)
+                    def extract_scalar_recursive(data):
+                        if not isinstance(data, dict):
+                            return data
+                        for key in ["result", "answer", "output", "value", "content"]:
+                            if key in data:
+                                val = data[key]
+                                if isinstance(val, dict):
+                                    return extract_scalar_recursive(val)
+                                return val
+                        return data
+
                     # If result is a dict with common output keys, extract the value
                     if isinstance(result, dict):
-                        for out_key in ['answer', 'analysis', 'report', 'output', 'result']:
-                            if out_key in result:
-                                enriched[key] = result[out_key]
-                                print(f"         ✓ Injected {out_key} from step {step_num}")
-                                break
-                        else:
-                            # No common key found, use entire result
-                            enriched[key] = result
-                            print(f"         ✓ Injected full result from step {step_num}")
+                         enriched[key] = extract_scalar_recursive(result)
+                         print(f"         ✓ Injected extracted value from step {step_num}")
                     else:
                         enriched[key] = result
                         print(f"         ✓ Injected result from step {step_num}")
     
-    # Strategy 1: Use capability-specific logic
+    # Strategy 1: Generic Input Chaining
+    # This replaces specific capability checks (math, transform, etc.) with a generic heuristic.
+    # If parameters are missing but required, try to fill them from the previous step result.
+    
+    # Identify potential "chainable" input parameters
+    # These are common names for primary inputs in agent capabilities
+    primary_input_keys = ["data", "input", "value", "text", "context", "a", "base", "equation", "numbers", "code", "content"]
+    
+    # Identify which keys are present in current parameters but empty/None
+    missing_keys = [k for k in primary_input_keys if k in enriched and (enriched[k] is None or enriched[k] == "")]
+    
+    # Also check if any critical primary keys are completely missing from parameters
+    # (In a real system, we would check the agent's schema definition here)
+    # For now, we assume if specific common keys are standard for a capability, we check them
+    
+    # If we have missing inputs and previous results exist
+    if step_results:
+        # Get the most recent result (Step N-1)
+        # Sort by step number to ensure we get the last one
+        try:
+            last_key = sorted(step_results.keys(), key=lambda x: int(x.split('_')[1]))[-1]
+            last_result = step_results[last_key]["result"]
+        except Exception as e:
+             print(f"      ⚠️  Error extracting last result: {e}")
+             return enriched
+        
+        # Extract the actual value from the result structure
+        chain_value = last_result
+        
+        # Helper to extract scalar from dict
+        def extract_scalar(data):
+            if not isinstance(data, dict):
+                return data
+            
+            # Prioritize specific keys
+            for key in ["result", "answer", "output", "value", "content"]:
+                if key in data:
+                    val = data[key]
+                    # If extraction yielded another dict, recurse one level
+                    if isinstance(val, dict):
+                        return extract_scalar(val)
+                    return val
+            return data
+
+        chain_value = extract_scalar(last_result)
+        
+        # Apply Generic Chaining Rules
+        
+        # Rule 1: Fill missing primary inputs
+        for key in missing_keys:
+            if enriched[key] is None or enriched[key] == "":
+                enriched[key] = chain_value
+                print(f"         ✓ Generic Chain: Injected previous result into '{key}'")
+        
+        # Rule 2: If 'transform_data' or 'analyze_data' or 'generate_report', ensure 'data' is filled
+        if capability in ["transform_data", "analyze_data", "generate_report"] and "data" not in enriched:
+             enriched["data"] = chain_value
+             print(f"         ✓ Generic Chain: Injected previous result into 'data'")
+             
+        # Rule 3: Math specific chaining (generic fallback for numeric inputs)
+        if capability in ["calculate", "advanced_math", "solve_equation", "statistics"]:
+            # If 'value', 'a', or 'base' are missing, inject numeric values
+            target_keys = ["value", "a", "base", "numbers"]
+            for target in target_keys:
+                if target not in enriched or enriched[target] is None:
+                    # Only inject if we have a numeric-like value
+                    is_numeric = isinstance(chain_value, (int, float)) or (isinstance(chain_value, str) and chain_value.replace('.','',1).isdigit())
+                    if is_numeric:
+                        if target == "numbers" and not isinstance(chain_value, list):
+                            enriched[target] = [chain_value] # Wrap single number for statistics
+                        else:
+                            enriched[target] = chain_value
+                        print(f"         ✓ Generic Chain: Injected numeric result into '{target}'")
+                        break # Only fill one primary input per step to avoid 'a' and 'b' being same
+                        
+    # Strategy 2: Specific overrides if needed (kept minimal)
     if capability == "compare_concepts":
         # Need two concepts to compare
         if "concept_a" not in enriched or not enriched["concept_a"]:
@@ -95,29 +208,6 @@ async def enrich_with_workflow_context(
                     parts = step_description.lower().split("and")
                     enriched["concept_b"] = parts[-1].strip()
                     print(f"         ✓ Injected one result + parsed concept from description")
-    
-    elif capability == "generate_report":
-        # Reports often summarize previous work
-        if not enriched or "data" not in enriched:
-            # Collect all previous meaningful results
-            all_results = {
-                f"{res['capability']}_result": res['result']
-                for res in step_results.values()
-            }
-            enriched["data"] = all_results
-            enriched["context"] = step_description
-            print(f"         ✓ Injected {len(all_results)} previous results for report")
-    
-    elif capability == "transform_data":
-        if "data" not in enriched or not enriched["data"]:
-            # Use last data analysis or processing result
-            if "analyze_data" in capability_outputs:
-                enriched["data"] = capability_outputs["analyze_data"]
-                print(f"         ✓ Injected analyzed data")
-            elif step_results:
-                last_result = list(step_results.values())[-1]["result"]
-                enriched["data"] = last_result
-                print(f"         ✓ Injected last step result as data")
     
     elif capability == "explain_code":
         if "code" not in enriched or not enriched["code"]:
@@ -429,6 +519,10 @@ def init_websocket_handler():
     print("✓ WebSocket handler initialized")
 
 
+# Global store for session history (persists across workflows)
+# Format: session_id -> list of {"task": str, "result": str, "timestamp": str}
+session_store: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+
 
 @app.get("/")
 async def root():
@@ -456,11 +550,13 @@ async def execute_workflow(request: Dict[str, Any]):
         raise HTTPException(status_code=400, detail="task_description required")
     
     workflow_id = request.get("workflow_id", str(datetime.utcnow().timestamp()))
+    session_id = request.get("session_id")
     async_mode = request.get("async", False)  # Support async execution
     
     # Register workflow immediately in both memory and DB
     workflow_state = {
         "workflow_id": workflow_id,
+        "session_id": session_id,  # Store session ID
         "status": "initializing",
         "task_description": task_description,
         "start_time": datetime.utcnow().isoformat(),
@@ -484,7 +580,9 @@ async def execute_workflow(request: Dict[str, Any]):
         # Run workflow in background task
         async def run_workflow_with_error_handling():
             try:
-                await _execute_workflow_internal(workflow_id, task_description)
+                # Mock headers for identity propagation (In real app, extract from request)
+                mock_headers = {"X-User-ID": "user_123", "X-User-Role": "admin"}
+                await _execute_workflow_internal(workflow_id, task_description, headers=mock_headers)
             except Exception as e:
                 print(f"❌ Background workflow execution failed: {e}")
                 import traceback
@@ -503,19 +601,47 @@ async def execute_workflow(request: Dict[str, Any]):
         }
     else:
         # Run workflow synchronously (original behavior)
-        return await _execute_workflow_internal(workflow_id, task_description)
+        # Mock headers for identity propagation
+        mock_headers = {"X-User-ID": "user_123", "X-User-Role": "admin"}
+        return await _execute_workflow_internal(workflow_id, task_description, headers=mock_headers)
 
 
-async def _execute_workflow_internal(workflow_id: str, task_description: str):
+async def _execute_workflow_internal(workflow_id: str, task_description: str, headers: Dict[str, str] = None):
     """Internal workflow execution logic"""
+    headers = headers or {}
+    user_context = security_manager.get_user_context(headers)
+    user_id = user_context["user_id"]
+    
     print(f"\n{'='*80}")
-    print(f"🚀 WORKFLOW EXECUTION STARTED")
+    print(f"🚀 WORKFLOW EXECUTION STARTED (User: {user_id})")
     print(f"{'='*80}")
+    
+    # AUDIT: Log workflow start
+    audit_logger.log_event(workflow_id, user_id, "WORKFLOW_START", {"task": task_description})
+    
+    # GUARDRAIL: Input Validation
+    is_valid, reason = guardrails.validate_input(task_description)
+    if not is_valid:
+        error_msg = f"Guardrail Blocked Input: {reason}"
+        print(f"❌ {error_msg}")
+        audit_logger.log_event(workflow_id, user_id, "GUARDRAIL_VIOLATION", {"reason": reason})
+        raise HTTPException(status_code=400, detail=error_msg)
+        
     print(f"Workflow ID: {workflow_id}")
     print(f"Task: {task_description}")
     print()
     
     execution_log = []
+    
+    # Retrieve session history
+    workflow_state = active_workflows.get(workflow_id, {})
+    session_id = workflow_state.get("session_id")
+    session_history = None
+    if session_id:
+        # Retrieve from DB instead of memory
+        session_history = db.get_session_history(session_id)
+        if session_history:
+            print(f"   📜 Found {len(session_history)} previous session interactions")
     
     try:
         # PHASE 1: THINK - Understand the task and available resources
@@ -551,7 +677,7 @@ async def _execute_workflow_internal(workflow_id: str, task_description: str):
         print(f"\n📋 PHASE 2: PLAN - Generating dynamic execution plan...")
         print(f"   Model: {BEDROCK_MODEL_ID}")
         
-        plan = await generate_dynamic_plan(task_description, capabilities, capability_descriptions)
+        plan = await generate_dynamic_plan(task_description, capabilities, capability_descriptions, session_history)
         
         print(f"   Generated plan with {len(plan.get('steps', []))} steps")
         print(f"   Reasoning: {plan.get('reasoning', 'N/A')[:200]}...")
@@ -605,20 +731,6 @@ async def _execute_workflow_internal(workflow_id: str, task_description: str):
             print(f"      Capability: {capability}")
             print(f"      Initial Parameters: {json.dumps(parameters, indent=10)}")
             
-            # Notify WebSocket clients: step started
-            if ws_handler and ws_handler.connection_manager.has_connections(workflow_id):
-                await ws_handler.connection_manager.broadcast_to_workflow(workflow_id, {
-                    "type": "step_started",
-                    "workflow_id": workflow_id,
-                    "step": {
-                        "step_number": step_num,
-                        "total_steps": len(plan.get('steps', [])),
-                        "capability": capability,
-                        "description": description
-                    },
-                    "timestamp": datetime.utcnow().isoformat()
-                })
-            
             # Find agent for capability
             if capability not in capabilities:
                 print(f"      ❌ No agent found for capability: {capability}")
@@ -635,13 +747,29 @@ async def _execute_workflow_internal(workflow_id: str, task_description: str):
             
             print(f"      Agent: {agent_name}")
             print(f"      Endpoint: {agent_endpoint}")
+
+            # Notify WebSocket clients: step started
+            if ws_handler and ws_handler.connection_manager.has_connections(workflow_id):
+                await ws_handler.connection_manager.broadcast_to_workflow(workflow_id, {
+                    "type": "step_started",
+                    "workflow_id": workflow_id,
+                    "step": {
+                        "step_number": step_num,
+                        "total_steps": len(plan.get('steps', [])),
+                        "capability": capability,
+                        "description": description,
+                        "agent": agent_name
+                    },
+                    "timestamp": datetime.utcnow().isoformat()
+                })
             
             # Dynamically enrich parameters with workflow context
             enriched_parameters = await enrich_with_workflow_context(
                 capability=capability,
                 parameters=parameters,
                 workflow_context=workflow_context,
-                step_description=description
+                step_description=description,
+                session_history=session_history
             )
             
             print(f"      Enriched Parameters: {json.dumps(enriched_parameters, indent=10)}")
@@ -656,8 +784,30 @@ async def _execute_workflow_internal(workflow_id: str, task_description: str):
                     "step_id": f"step_{step_num}",
                     "agent_name": agent_name,
                     "total_steps": len(plan.get('steps', [])),
-                    "workflow_context": workflow_context
+                    "workflow_context": workflow_context,
+                    "user_identity": user_context # Propagate Identity
                 }
+            )
+            
+            # SECURITY: Tool Authorization (Deterministic Check)
+            if not security_manager.validate_tool_authorization(user_context["role"], capability, enriched_parameters):
+                error_msg = f"Security Policy Blocked: Authorization failed for '{capability}' with params {enriched_parameters}"
+                print(f"      ❌ {error_msg}")
+                audit_logger.log_event(workflow_id, user_id, "SECURITY_VIOLATION", {"capability": capability, "params": enriched_parameters})
+                execution_log.append({
+                    "step_number": step_num,
+                    "status": "failed",
+                    "error": error_msg
+                })
+                continue
+
+            # AUDIT: Log CoT (Thought/Plan)
+            audit_logger.log_cot(
+                workflow_id, step_num, 
+                thought=f"Need to execute {capability}", 
+                plan=f"Call agent {agent_name}", 
+                observation="Pending", 
+                action=f"Invoke {capability} with {enriched_parameters}"
             )
             
             # Execute task
@@ -770,6 +920,14 @@ async def _execute_workflow_internal(workflow_id: str, task_description: str):
                     workflow_state["results"].append(result_data)
                     
                     # Update workflow context with result
+                    
+                    # GUARDRAIL: Output Validation (PII Redaction / Topic Filtering)
+                    if isinstance(response.result, str):
+                        is_valid_out, sanitized_result = guardrails.validate_output(response.result)
+                        if not is_valid_out:
+                            print(f"      ⚠️  Guardrail Modified Output: {sanitized_result}")
+                        response.result = sanitized_result
+                    
                     workflow_context["step_results"][f"step_{step_num}"] = {
                         "description": description,
                         "capability": capability,
@@ -779,6 +937,15 @@ async def _execute_workflow_internal(workflow_id: str, task_description: str):
                     
                     print(f"      ✅ Step {step_num} VERIFIED - Success")
                     print(f"      Result: {str(response.result)[:200]}...")
+                    
+                    # AUDIT: Log Observation
+                    audit_logger.log_cot(
+                        workflow_id, step_num, 
+                        thought="Execution completed", 
+                        plan="Verify result", 
+                        observation=str(response.result)[:500], 
+                        action="Proceed to next step"
+                    )
                     
                     execution_log.append({
                         "phase": "EXECUTE-VERIFY",
@@ -1304,6 +1471,32 @@ async def resume_workflow(workflow_id: str) -> Dict[str, Any]:
                 "success_rate": f"{len(workflow_state['completed_steps'])}/{len(plan['steps'])}"
             }
             
+            # Save to session history if session_id exists
+            if session_id:
+                # Extract main result/summary
+                final_output = ""
+                # Try to get the result of the last step or report
+                if workflow_state["results"]:
+                    last_result = workflow_state["results"][-1]["result"]
+                    if isinstance(last_result, dict) and "answer" in last_result:
+                        final_output = last_result["answer"]
+                    elif isinstance(last_result, dict) and "report" in last_result:
+                         final_output = last_result["report"]
+                    else:
+                        final_output = str(last_result)
+                
+                history_item = {
+                    "task": task_description,
+                    "result": final_output,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "workflow_id": workflow_id
+                }
+                db.save_session_history(session_id, history_item)
+                
+                # Get count for logging
+                hist = db.get_session_history(session_id)
+                print(f"   💾 Saved workflow result to session history ({len(hist)} items)")
+
             # Notify WebSocket
             if ws_handler and ws_handler.connection_manager.has_connections(workflow_id):
                 await ws_handler.connection_manager.broadcast_to_workflow(workflow_id, {
@@ -1435,7 +1628,8 @@ async def _handle_additional_input_request(
 async def generate_dynamic_plan(
     task_description: str,
     capabilities: Dict[str, List[Dict]],
-    capability_descriptions: Dict[str, str]
+    capability_descriptions: Dict[str, str],
+    session_history: List[Dict] = None
 ) -> Dict[str, Any]:
     """
     Generate dynamic execution plan using LLM with full capability context.
@@ -1443,6 +1637,18 @@ async def generate_dynamic_plan(
     """
     
     capabilities_list = list(capabilities.keys())
+    
+    # Format session history if available
+    history_str = ""
+    if session_history:
+        history_str = "\nPREVIOUS CONVERSATION HISTORY (Use this context if relevant):\n"
+        for i, entry in enumerate(session_history[-5:]):  # Limit to last 5 turns
+            history_str += f"Turn {i+1} User Task: {entry['task']}\n"
+            # Summarize result if too long
+            result_preview = str(entry['result'])
+            if len(result_preview) > 800:
+                result_preview = result_preview[:800] + "... (truncated)"
+            history_str += f"Turn {i+1} Result: {result_preview}\n\n"
     
     # Build detailed capability descriptions with context
     capabilities_details = []
@@ -1460,6 +1666,8 @@ async def generate_dynamic_plan(
 USER TASK:
 {task_description}
 
+{history_str}
+
 AVAILABLE CAPABILITIES:
 {capabilities_str}
 
@@ -1470,6 +1678,7 @@ INSTRUCTIONS:
 4. If the task mentions "then" or "and", treat those as separate steps
 5. For comparison tasks, first research each concept separately, THEN compare them
 6. For report generation, gather all required data first, THEN generate the report
+7. If the user refers to previous context (e.g., "rewrite the whitepaper", "how does this change X"), explicitly fetch that context using 'answer_question' or pass the relevant context in parameters.
 
 EXAMPLES:
 
@@ -1534,12 +1743,53 @@ Return ONLY the JSON object. No markdown formatting, no code blocks, no explanat
     print(f"   Calling Bedrock with model: {BEDROCK_MODEL_ID}")
     print(f"   Temperature: 0.1 (low for structured output)")
     
+    if session_history:
+        print(f"   Generating plan with {len(session_history)} history items")
+    
     try:
-        response = bedrock_client.converse(
-            modelId=BEDROCK_MODEL_ID,
-            messages=[{"role": "user", "content": [{"text": prompt}]}],
-            inferenceConfig={"maxTokens": 4000, "temperature": 0.1}
-        )
+        # Enable Prompt Caching for the System Prompt / Instructions
+        # We split the prompt into "System Instructions" (Cached) and "Current Task" (Dynamic)
+        
+        # 1. System Block (Cached)
+        system_content = [{
+            "text": prompt.split("USER TASK:")[0], # Everything before the dynamic user task
+            "cachePoint": {"type": "default"}
+        }]
+        
+        # 2. User Message (Dynamic)
+        user_content = [{"text": f"USER TASK:\n{task_description}\n\nAVAILABLE CAPABILITIES:\n{capabilities_str}\n\nINSTRUCTIONS: (As defined in system prompt)"}]
+        
+        # Actually, standard converse API puts system prompt in 'system' param
+        # Re-structuring to use 'system' parameter for caching
+        
+        system_instruction = prompt.split("USER TASK:")[0]
+        
+        # Include history in the user task part if available
+        user_task_part = f"USER TASK:\n{task_description}\n"
+        if history_str:
+            user_task_part += f"\n{history_str}\n"
+            
+        user_task_part += f"\nAVAILABLE CAPABILITIES:\n{capabilities_str}\n\nGenerate the JSON execution plan based on the system instructions."
+
+        try:
+            response = bedrock_client.converse(
+                modelId=BEDROCK_MODEL_ID,
+                system=[{
+                    "text": system_instruction,
+                    "cachePoint": {"type": "default"} # Cache the heavy instruction set
+                }],
+                messages=[{"role": "user", "content": [{"text": user_task_part}]}],
+                inferenceConfig={"maxTokens": 4000, "temperature": 0.1}
+            )
+        except Exception as e:
+            print(f"   ⚠️ Prompt Caching failed (likely unsupported by current SDK/Region). Retrying without cache: {e}")
+            # Fallback to standard request without cachePoint
+            response = bedrock_client.converse(
+                modelId=BEDROCK_MODEL_ID,
+                system=[{"text": system_instruction}],
+                messages=[{"role": "user", "content": [{"text": user_task_part}]}],
+                inferenceConfig={"maxTokens": 4000, "temperature": 0.1}
+            )
         
         content = response['output']['message']['content'][0]['text']
         print(f"   ✓ LLM Response received ({len(content)} characters)")
@@ -1735,6 +1985,20 @@ def create_intelligent_default_plan(task_description: str, capabilities: List[st
                 step_num += 1
         
         elif "code" in part_lower or "python" in part_lower:
+            # Check if it's actually asking to rewrite text about code/python
+            if "rewrite" in part_lower or "write" in part_lower or "explain" in part_lower:
+                if "answer_question" in capabilities:
+                     steps.append({
+                        "step_number": step_num,
+                        "capability": "answer_question",
+                        "description": f"Research and answer: {part.strip()}",
+                        "parameters": {"question": part.strip()},
+                        "expected_output": "Answer",
+                        "depends_on": []
+                    })
+                     step_num += 1
+                     continue # Skip other checks for this part
+            
             if "analyze_python_code" in capabilities:
                 steps.append({
                     "step_number": step_num,
@@ -1816,9 +2080,21 @@ async def generate_reflection(
             "result_length": len(str(step_data.get("result", "")))
         })
     
-    prompt = f"""You are reflecting on a multi-agent workflow execution.
+    
+    system_instruction = f"""You are reflecting on a multi-agent workflow execution. Analyze the execution and provide a structured reflection.
 
-ORIGINAL TASK:
+Return JSON format:
+{{
+  "summary": "2-3 sentence summary of execution",
+  "success_rate": "{success_rate}",
+  "success_percentage": {success_percentage:.1f},
+  "strengths": ["what worked well"],
+  "weaknesses": ["what didn't work"],
+  "suggestions": ["how to improve"],
+  "overall_assessment": "excellent|good|fair|poor"
+}}"""
+
+    user_context = f"""ORIGINAL TASK:
 {task_description}
 
 EXECUTION PLAN:
@@ -1836,27 +2112,28 @@ ANALYZE:
 2. Did steps execute in the right order?
 3. Was context properly shared between steps?
 4. Were any steps unnecessary or missing?
-5. What could be improved?
-
-Provide a brief reflection in JSON format:
-{{
-  "summary": "2-3 sentence summary of execution",
-  "success_rate": "{success_rate}",
-  "success_percentage": {success_percentage:.1f},
-  "strengths": ["what worked well"],
-  "weaknesses": ["what didn't work"],
-  "suggestions": ["how to improve"],
-  "overall_assessment": "excellent|good|fair|poor"
-}}
-
-Return only valid JSON."""
+5. What could be improved?"""
     
     try:
-        response = bedrock_client.converse(
-            modelId=BEDROCK_MODEL_ID,
-            messages=[{"role": "user", "content": [{"text": prompt}]}],
-            inferenceConfig={"maxTokens": 2000, "temperature": 0.5}
-        )
+        # Enable Prompt Caching for the System Instruction
+        try:
+            response = bedrock_client.converse(
+                modelId=BEDROCK_MODEL_ID,
+                system=[{
+                    "text": system_instruction,
+                    "cachePoint": {"type": "default"}
+                }],
+                messages=[{"role": "user", "content": [{"text": user_context}]}],
+                inferenceConfig={"maxTokens": 2000, "temperature": 0.5}
+            )
+        except Exception as e:
+            print(f"   ⚠️ Prompt Caching failed. Retrying without cache: {e}")
+            response = bedrock_client.converse(
+                modelId=BEDROCK_MODEL_ID,
+                system=[{"text": system_instruction}],
+                messages=[{"role": "user", "content": [{"text": user_context}]}],
+                inferenceConfig={"maxTokens": 2000, "temperature": 0.5}
+            )
         
         content = response['output']['message']['content'][0]['text']
         content = content.strip()

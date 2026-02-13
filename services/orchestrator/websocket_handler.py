@@ -71,21 +71,32 @@ class ConnectionManager:
     
     async def broadcast_to_workflow(self, workflow_id: str, message: Dict[str, Any]):
         """Send message to all connections for a workflow"""
-        if workflow_id not in self.active_connections:
+        # Snapshot the connections to avoid modification during iteration
+        connections_to_notify = []
+        async with self._lock:
+            if workflow_id in self.active_connections:
+                connections_to_notify = list(self.active_connections[workflow_id])
+        
+        if not connections_to_notify:
             return
         
         disconnected = []
         
-        for websocket in self.active_connections[workflow_id].copy():
+        for websocket in connections_to_notify:
             try:
+                # Check if websocket is still open before sending (best effort)
+                # Starlette/FastAPI doesn't expose 'closed' property reliably on standard WebSocket object
+                # but we catch exceptions
                 await websocket.send_json(message)
-            except Exception as e:
-                logger.error(f"Error broadcasting to connection: {e}")
+            except (RuntimeError, WebSocketDisconnect, Exception) as e:
+                # 'RuntimeError: Cannot call "send" once a close message has been sent.'
+                # logger.warning(f"Error broadcasting to connection: {e}")
                 disconnected.append(websocket)
         
         # Clean up disconnected sockets
-        for websocket in disconnected:
-            await self.disconnect(websocket)
+        if disconnected:
+            for websocket in disconnected:
+                await self.disconnect(websocket)
     
     def get_workflow_connections(self, workflow_id: str) -> int:
         """Get number of active connections for a workflow"""

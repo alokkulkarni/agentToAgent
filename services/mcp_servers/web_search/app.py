@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 
 
 # Environment Configuration
-SERVER_HOST = os.getenv("MCP_WEB_SEARCH_HOST", "0.0.0.0")
+SERVER_HOST = os.getenv("MCP_WEB_SEARCH_HOST", "127.0.0.1")
 SERVER_PORT = int(os.getenv("MCP_WEB_SEARCH_PORT", "8212"))
 MCP_REGISTRY_URL = os.getenv("MCP_REGISTRY_URL", "http://localhost:8200")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "info")

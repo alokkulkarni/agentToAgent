@@ -414,6 +414,52 @@ class WorkflowDatabase:
                 CREATE INDEX IF NOT EXISTS idx_thought_workflow 
                 ON thought_trail(workflow_id)
             """)
+            
+            # Sessions table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS sessions (
+                    session_id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    history TEXT  -- JSON list of interactions
+                )
+            """)
+
+    def save_session_history(self, session_id: str, history_item: Dict[str, Any]):
+        """Append an item to session history"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Get existing history
+            cursor.execute("SELECT history FROM sessions WHERE session_id = ?", (session_id,))
+            row = cursor.fetchone()
+            
+            if row:
+                history = json.loads(row['history']) if row['history'] else []
+                history.append(history_item)
+                
+                cursor.execute("""
+                    UPDATE sessions 
+                    SET history = ?, updated_at = ?
+                    WHERE session_id = ?
+                """, (json.dumps(history), datetime.utcnow().isoformat(), session_id))
+            else:
+                history = [history_item]
+                cursor.execute("""
+                    INSERT INTO sessions (session_id, created_at, updated_at, history)
+                    VALUES (?, ?, ?, ?)
+                """, (session_id, datetime.utcnow().isoformat(), datetime.utcnow().isoformat(), json.dumps(history)))
+
+    def get_session_history(self, session_id: str) -> List[Dict[str, Any]]:
+        """Get session history"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT history FROM sessions WHERE session_id = ?", (session_id,))
+            row = cursor.fetchone()
+            
+            if row and row['history']:
+                return json.loads(row['history'])
+            return []
     
     def save_message(self, message: 'ConversationMessage'):
         """Save conversation message"""
