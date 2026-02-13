@@ -9,11 +9,8 @@ class GuardrailService:
     
     def __init__(self):
         self.config = EnterpriseConfig
-        self.pii_patterns = {
-            "SSN": r"\b\d{3}-\d{2}-\d{4}\b",
-            "CreditCard": r"\b\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b",
-            "Email": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"
-        }
+        self.guardrail_config = self.config.load_guardrail_config()
+        self.pii_patterns = self.guardrail_config.get("pii_patterns", {})
         self.token_map = {} # In-memory vault for demo purposes
 
     def tokenize_pii(self, text: str) -> str:
@@ -65,10 +62,11 @@ class GuardrailService:
         if not self.config.ENABLE_GUARDRAILS:
             return True, None
             
-        # Check for jailbreak attempts
+        # Check for jailbreak attempts using configured sensitive terms
+        sensitive_terms = self.guardrail_config.get("sensitive_terms", self.config.SENSITIVE_TERMS)
         prompt_lower = prompt.lower()
-        for term in self.config.SENSITIVE_TERMS:
-            if term in prompt_lower:
+        for term in sensitive_terms:
+            if term.lower() in prompt_lower:
                 return False, f"Guardrail Violation: blocked term '{term}' detected."
                 
         return True, None
@@ -85,8 +83,9 @@ class GuardrailService:
         
         # Topic Deny-list (Simple keyword check for simulation)
         # In production, this would use a topic classification model
-        for topic in self.config.DENIED_TOPICS:
-            if topic and topic.replace("_", " ") in sanitized_text.lower():
+        denied_topics = self.guardrail_config.get("denied_topics", self.config.DENIED_TOPICS)
+        for topic in denied_topics:
+            if topic and topic.replace("_", " ").lower() in sanitized_text.lower():
                 return False, f"Guardrail Violation: Output contains denied topic '{topic}'."
         
         # PII Redaction
@@ -94,8 +93,16 @@ class GuardrailService:
             for pii_type, pattern in self.pii_patterns.items():
                 sanitized_text = re.sub(pattern, f"[{pii_type}_REDACTED]", sanitized_text)
                 
-        # Financial Disclaimer
-        if "financial" in sanitized_text.lower() or "investment" in sanitized_text.lower():
-            sanitized_text += "\n\n[DISCLAIMER: This is AI-generated content and does not constitute professional financial advice.]"
+        # Financial & Other Disclaimers (Configurable)
+        disclaimers = self.guardrail_config.get("disclaimers", [])
+        text_lower = sanitized_text.lower()
+        
+        for disclaimer in disclaimers:
+            keywords = disclaimer.get("trigger_keywords", [])
+            message = disclaimer.get("message", "")
+            
+            should_apply = any(kw.lower() in text_lower for kw in keywords)
+            if should_apply and message not in sanitized_text:
+                sanitized_text += message
             
         return True, sanitized_text

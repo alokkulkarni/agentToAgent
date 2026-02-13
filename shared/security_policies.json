@@ -1,0 +1,24 @@
+{
+  "policies": {
+    "transfer_funds": {
+      "limits": {
+        "amount": 2000.0
+      },
+      "requires_approval": true
+    },
+    "calculate": {
+      "limits": {
+        "a": 5000.0,
+        "b": 5000.0
+      },
+      "description": "Proxy limit for calculation inputs"
+    },
+    "default": {
+      "max_transaction_limit": 1000.0
+    }
+  },
+  "global_settings": {
+    "enable_security_checks": true,
+    "strict_mode": false
+  }
+}
