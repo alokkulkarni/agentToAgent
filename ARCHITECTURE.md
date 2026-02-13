@@ -1,558 +1,174 @@
-# A2A System Architecture
-
-**Comprehensive System Architecture and Design Documentation**
-
-Last Updated: 2026-02-07
-
----
-
-## Table of Contents
-
-1. [Overview](#overview)
-2. [High-Level Architecture](#high-level-architecture)
-3. [Component Details](#component-details)
-4. [Service Communication](#service-communication)
-5. [Port Allocation](#port-allocation)
-6. [Data Flow](#data-flow)
-7. [MCP Integration](#mcp-integration)
-8. [Workflow Execution](#workflow-execution)
-9. [Scalability & Performance](#scalability--performance)
-
----
+# System Architecture
 
 ## Overview
 
-The A2A (Agent-to-Agent) Multi-Agent System is a distributed framework that enables autonomous agents to collaborate on complex tasks through:
+The Agent-to-Agent (A2A) framework is a distributed, microservices-based system designed for autonomous multi-agent collaboration. It leverages AWS Bedrock for LLM capabilities and the Model Context Protocol (MCP) for standardized tool integration. The system is designed with enterprise-grade security, auditability, and context preservation at its core.
 
-- **Service Discovery**: Dynamic agent and tool registration
-- **LLM Planning**: Claude 3.5 Sonnet generates execution plans
-- **MCP Protocol**: Standardized tool integration
-- **Workflow Orchestration**: Intelligent task coordination
-- **Parallel Execution**: Concurrent step processing
+### High-Level Architecture
 
-### Key Principles
-
-1. **Loose Coupling**: Services communicate via REST APIs
-2. **Service Discovery**: Dynamic registration and capability matching
-3. **Fault Tolerance**: Retry mechanisms and circuit breakers
-4. **Extensibility**: Easy to add new agents and tools
-5. **Observability**: Comprehensive logging and monitoring
-
----
-
-## High-Level Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                                                                   │
-│                        CLIENT / USER                              │
-│                                                                   │
-└────────────────────────────┬──────────────────────────────────────┘
-                             │
-                             ↓
-            ┌────────────────────────────────┐
-            │     Orchestrator (8100)         │
-            │   - Workflow Planning (LLM)     │
-            │   - Step Execution              │
-            │   - Context Management          │
-            │   - Persistence & Retry         │
-            └────────────────┬────────────────┘
-                             │
-                    ┌────────┴──────────┐
-                    ↓                    ↓
-      ┌─────────────────────┐  ┌──────────────────┐
-      │  Registry (8000)     │  │ MCP Gateway      │
-      │  - Agent Discovery   │  │   (8300)         │
-      │  - Health Checks     │  │ - Tool Routing   │
-      │  - Capability Match  │  │ - LLM Selection  │
-      └──────────┬───────────┘  └────────┬─────────┘
-                 │                       │
-         ┌───────┴────────┐      ┌──────┴──────┐
-         ↓                ↓       ↓             ↓
-   ┌─────────┐     ┌───────────┐   ┌────────────────┐
-   │ Agents  │     │  Agents   │   │ MCP Registry   │
-   │ (8001-  │     │  (cont.)  │   │   (8200)       │
-   │  8006)  │     │           │   │ - Tool Disc.   │
-   └─────────┘     └───────────┘   └────────┬───────┘
-                                             │
-                                    ┌────────┴────────┐
-                                    ↓                  ↓
-                              ┌──────────┐      ┌──────────┐
-                              │MCP Tools │      │MCP Tools │
-                              │(8210-    │      │ (cont.)  │
-                              │ 8213)    │      │          │
-                              └──────────┘      └──────────┘
+```ascii
+[ USER / CLI ] <---> [ ORCHESTRATOR (The Brain) ] <---> [ MCP GATEWAY ]
+      |                       ^     |                         ^
+      |                       |     |                         |
+[ INTERACTION ]               |     +---> [ REGISTRY ]        |
+[ MANAGER     ]               |                               |
+                              |                               |
+                   +----------+-----------+                   |
+                   |                      |                   |
+           [ CONTEXT STORE ]      [ SECURITY LAYER ]          |
+           (Session History)      (Guardrails/Vault)          |
+                                          |                   |
+                                          v                   |
+                                 +------------------+         |
+                                 |   AGENT MESH     | --------+
+                                 | (Research, Code, |
+                                 |  Data, Math...)  |
+                                 +------------------+
 ```
 
 ---
 
-## Component Details
+## 1. Core Services
 
-### 1. Core Services
+### Orchestrator (Port 8100)
+The central nervous system of the framework.
+- **Workflow Planning**: Uses Claude 3.5 Sonnet to decompose user requests into executable steps.
+- **Context Management**: Maintains global conversation history across multiple workflows using a `session_id`.
+- **State Management**: Persists workflow state in SQLite/PostgreSQL.
+- **Security Integration**: Enforces identity propagation and guardrails.
 
-#### Registry Service (Port 8000)
-**Purpose**: Central service discovery and agent registration
+### Interaction Manager
+Handles human-in-the-loop scenarios.
+- **Suspension**: Pauses workflows when agent requires user input.
+- **Resumption**: Resumes execution with user feedback.
+- **Context Switching**: Allows users to branch off into new tasks while keeping the original workflow paused.
 
-**Capabilities**:
-- Agent registration with capabilities
-- Health check monitoring (60s timeout)
-- Capability-based agent lookup
-- Agent status tracking
+### Security Layer (New)
+Enterprise-grade security features embedded in the framework.
+- **SafeLLMClient**: A wrapper around AWS Bedrock client that enforces input/output guardrails.
+- **PII Vault**: Tokenizes sensitive data (Credit Cards, SSN) before sending to LLM; detokenizes for authorized tool calls.
+- **Audit Logger**: WORM (Write Once Read Many) compliant logging of "Thought, Plan, Observation, Action".
+- **Identity Propagation**: Propagates User ID and Roles (IAM style) to every agent and tool.
 
-**API Endpoints**:
-- `POST /api/registry/register` - Register agent
-- `GET /api/registry/agents` - List all agents
-- `GET /api/registry/capabilities/{capability}` - Find agents by capability
-- `POST /api/registry/heartbeat/{agent_id}` - Health check
-- `DELETE /api/registry/unregister/{agent_id}` - Unregister
-
-**Data Model**:
-```python
-{
-    "agent_id": "uuid",
-    "name": "AgentName",
-    "endpoint": "http://host:port",
-    "capabilities": [
-        {
-            "name": "capability_name",
-            "description": "...",
-            "input_schema": {...}
-        }
-    ]
-}
-```
-
-#### Orchestrator Service (Port 8100)
-**Purpose**: Workflow planning and execution coordination
-
-**Capabilities**:
-- LLM-based workflow planning (Claude 3.5)
-- Context enrichment between steps
-- Parallel step execution
-- Retry with exponential backoff
-- Workflow persistence (SQLite)
-- Result aggregation
-
-**Workflow Phases**:
-1. **DISCOVER** - Find available agents and capabilities
-2. **PLAN** - Generate execution plan via LLM
-3. **EXECUTE** - Run steps (parallel when possible)
-4. **VERIFY** - Validate results
-5. **REFLECT** - Analyze execution
-
-**API Endpoints**:
-- `POST /api/workflow/execute` - Execute workflow
-- `GET /api/workflow/{id}` - Get workflow status
-- `GET /api/workflows` - List workflows
-- `POST /api/workflow/{id}/resume` - Resume failed workflow
-
-#### MCP Registry (Port 8200)
-**Purpose**: MCP tool server discovery and registration
-
-**Capabilities**:
-- Tool server registration
-- Tool capability listing
-- Server health tracking
-- Tool discovery by name
-
-**API Endpoints**:
-- `POST /api/mcp/register` - Register MCP server
-- `GET /api/mcp/servers` - List tool servers
-- `GET /api/mcp/tools` - List all tools
-- `GET /api/mcp/tools/{tool_name}` - Get tool details
-- `DELETE /api/mcp/unregister/{server_id}` - Unregister
-
-#### MCP Gateway (Port 8300)
-**Purpose**: Route tool execution requests to appropriate MCP servers
-
-**Capabilities**:
-- Tool execution routing
-- LLM-based tool selection
-- Multiple server fallback
-- Load distribution
-- Error handling
-
-**API Endpoints**:
-- `POST /api/gateway/execute` - Execute tool
-- `GET /api/gateway/tools` - List available tools
+### MCP Gateway (Port 8300)
+The router for tool execution.
+- **Tool Discovery**: dynamically finds tools registered in MCP Registry.
+- **Load Balancing**: Distributes requests across available tool servers.
+- **Protocol Translation**: Converts Agent HTTP requests to MCP JSON-RPC protocol.
 
 ---
 
-### 2. Agent Services
+## 2. Context Preservation Architecture
 
-#### Code Analyzer (Port 8001)
-**Capabilities**: `analyze_python_code`, `explain_code`, `suggest_improvements`
+The system implements a hierarchical context model to support multi-turn, multi-workflow conversations.
 
-Analyzes Python code for quality, security, and best practices using Claude 3.5.
+```ascii
+Session (Global Context)
+   |
+   +--- Workflow A (Completed)
+   |      |
+   |      +--- Step 1 Result
+   |      +--- Step 2 Result
+   |
+   +--- Workflow B (Active)
+          |
+          +--- Step 1 (Current)
+```
 
-#### Data Processor (Port 8002)
-**Capabilities**: `transform_data`, `analyze_data`, `summarize_data`
-
-Processes and analyzes data, provides insights and summaries.
-
-#### Research Agent (Port 8003)
-**Capabilities**: `answer_question`, `research`, `generate_report`, `compare_concepts`
-
-Conducts research, answers questions, and generates comprehensive reports.
-
-#### Task Executor (Port 8004)
-**Capabilities**: `execute_command`, `file_operations`, `wait_task`
-
-Executes system commands and performs file operations.
-
-#### Observer (Port 8005)
-**Capabilities**: `system_monitoring`, `event_logging`, `metrics_reporting`
-
-Monitors system health, logs events, and reports metrics.
-
-#### Math Agent (Port 8006)
-**Capabilities**: `calculate`, `advanced_math`, `solve_equation`
-
-Performs mathematical operations by coordinating with MCP Calculator tool.
+1.  **Session ID**: A unique identifier generated at the start of a CLI/Web session.
+2.  **History Aggregation**: When a new workflow starts, the Orchestrator aggregates summaries of previous workflows in the same session.
+3.  **Prompt Injection**: This aggregated history is injected into the "Memory" section of the Planner LLM's prompt.
+4.  **Result Persistence**: Workflow results are stored with the Session ID to facilitate retrieval.
 
 ---
 
-### 3. MCP Tool Servers
+## 3. Enterprise Security Architecture
 
-#### Calculator Server (Port 8213)
-**Tools**: `add`, `subtract`, `multiply`, `divide`, `power`, `square`, `sqrt`, `abs`
+### Sequence Diagram: Secure Request Flow
 
-Provides mathematical computation capabilities.
+```ascii
+      User           Orchestrator      Guardrail       PII Vault         Agent           LLM            Tool
+       |                 |                 |               |               |              |               |
+       | "Transfer $500" |                 |               |               |              |               |
+       |---------------->|                 |               |               |              |               |
+       |                 | Validate Input  |               |               |              |               |
+       |                 |---------------->|               |               |              |               |
+       |                 |      Safe       |               |               |              |               |
+       |                 |<----------------|               |               |              |               |
+       |                 |                 |               |               |              |               |
+       |                 | Tokenize("1234")|               |               |              |               |
+       |                 |-------------------------------->|               |              |               |
+       |                 |   "TOKEN_99"    |               |               |              |               |
+       |                 |<--------------------------------|               |              |               |
+       |                 |                 |               |               |              |               |
+       |                 | Execute Task ("Transfer... TOKEN_99")           |              |               |
+       |                 |------------------------------------------------>|              |               |
+       |                 |                 |               |               | Generate Plan|               |
+       |                 |                 |               |               | (Tokenized)  |               |
+       |                 |                 |               |               |------------->|               |
+       |                 |                 |               |               | Call Tool    |               |
+       |                 |                 |               |               | transfer(...) |              |
+       |                 |                 |               |               |<-------------|               |
+       |                 |                 |               |               |              |               |
+       |                 |                 |               | Detokenize("TOKEN_99")       |               |
+       |                 |                 |               |<-----------------------------|               |
+       |                 |                 |               |   "1234-5678" |              |               |
+       |                 |                 |               |-------------->|              |               |
+       |                 |                 |               |               |              |               |
+       |                 |                 |               |               | Execute transfer(500, "1234")|
+       |                 |                 |               |               |----------------------------->|
+       |                 |                 |               |               |              Success         |
+       |                 |                 |               |               |<-----------------------------|
+       |                 |                 |               |               |              |               |
+       |                 | Task Complete   |               |               |              |               |
+       |                 |<------------------------------------------------|              |               |
+       |    "Success"    |                 |               |               |              |               |
+       |<----------------|                 |               |               |              |               |
+       |                 |                 |               |               |              |               |
+```
 
-#### Database Server (Port 8211)
-**Tools**: `query`, `insert`, `update`, `delete`, `create_table`
+### Components
 
-Executes SQLite database operations.
+1.  **Guardrails**:
+    *   **Input**: Blocks malicious prompts, prompt injection, and banned topics.
+    *   **Output**: Filters PII that wasn't caught by the Vault, blocks harmful content.
+    *   **Implementation**: AWS Bedrock Guardrails or NeMo Guardrails proxy.
 
-#### File Operations Server (Port 8210)
-**Tools**: `read_file`, `write_file`, `list_files`, `search_files`
+2.  **PII Vault**:
+    *   **Tokenization**: Replaces sensitive patterns (Regex-based) with UUID tokens.
+    *   **Storage**: Secure ephemeral dictionary or Redis.
+    *   **Detokenization**: Only allowed for "Authorized Tools" (e.g., a banking API). The LLM never sees the real data.
 
-Performs file system operations.
-
-#### Web Search Server (Port 8212)
-**Tools**: `search`, `get_page_content`
-
-Searches the web and retrieves content.
+3.  **Audit Logging**:
+    *   **Structure**: `{timestamp, trace_id, actor, action, thought, input, output, hash}`.
+    *   **Tamper-Evidence**: Each log entry includes a hash of the previous entry (Blockchain-style chaining).
 
 ---
 
-## Service Communication
+## 4. MCP Tool Integration
 
-### Agent-to-Registry
-```
-Agent → POST /api/registry/register → Registry
-      ← 201 Created + agent_id
+The system uses the Model Context Protocol to standardize tool usage.
 
-Agent → POST /api/registry/heartbeat/{id} → Registry (every 30s)
-      ← 200 OK
-```
-
-### Orchestrator-to-Agent
-```
-Orchestrator → GET /api/registry/capabilities/{cap} → Registry
-             ← Agent list
-
-Orchestrator → POST /api/task → Agent
-             ← Task result
-```
-
-### Agent-to-MCP
-```
-Agent → POST /api/gateway/execute → MCP Gateway
-      ↓
-      GET /api/mcp/tools/{name} → MCP Registry
-      ← Server info
-      ↓
-      POST /api/tools/execute → MCP Server
-      ← Tool result
-      ↑
-      ← Result to Agent
-```
+### Web Search Integration
+*   **Server**: `services/mcp_servers/web_search`
+*   **Tool**: `search(query)`, `get_content(url)`
+*   **Flow**: Research Agent -> MCP Gateway -> Web Search Server -> DuckDuckGo/Google API -> Agent.
+*   **Caching**: Prompt caching enabled for search results to reduce latency and cost on repeated queries.
 
 ---
 
-## Port Allocation
+## 5. Performance Optimizations
 
-### Core Services (8000-8100)
-- **8000**: Registry Service
-- **8100**: Orchestrator Service
+### Prompt Caching
+*   **Static Context**: System instructions and tool definitions are marked as `cachePoint` (block type `system`).
+*   **Dynamic Context**: Conversation history and variable inputs are appended after the cache point.
+*   **Benefit**: Reduces input token processing time and cost by ~90% for long conversations.
 
-### Agent Services (8001-8006)
-- **8001**: Code Analyzer
-- **8002**: Data Processor  
-- **8003**: Research Agent
-- **8004**: Task Executor
-- **8005**: Observer
-- **8006**: Math Agent
-
-### MCP Services (8200-8300)
-- **8200**: MCP Registry
-- **8300**: MCP Gateway
-
-### MCP Tools (8210-8213)
-- **8210**: File Operations Server
-- **8211**: Database Server
-- **8212**: Web Search Server
-- **8213**: Calculator Server
+### Parallel Execution
+*   **Independent Steps**: The Orchestrator identifies steps with no dependencies and schedules them concurrently.
+*   **AsyncIO**: All services use Python `asyncio` for non-blocking I/O.
 
 ---
 
-## Data Flow
-
-### Example: "Add 25 and 17, then square the result"
-
-```
-1. CLIENT
-   ↓ POST /api/workflow/execute
-   
-2. ORCHESTRATOR (DISCOVER)
-   ↓ GET /api/registry/agents
-   ← [CodeAnalyzer, DataProcessor, ResearchAgent, MathAgent, ...]
-   
-3. ORCHESTRATOR (PLAN via LLM)
-   → Claude 3.5: Generate plan for task
-   ← Plan: [
-       Step 1: Use 'calculate' capability with add(25, 17)
-       Step 2: Use 'advanced_math' capability with square(result)
-     ]
-   
-4. ORCHESTRATOR (EXECUTE Step 1)
-   ↓ GET /api/registry/capabilities/calculate
-   ← MathAgent (8006)
-   ↓ POST /api/task → MathAgent
-   
-5. MATH AGENT
-   ↓ POST /api/gateway/execute (tool: add, a:25, b:17)
-   
-6. MCP GATEWAY
-   ↓ GET /api/mcp/tools/add → MCP Registry
-   ← CalculatorServer (8213)
-   ↓ POST /api/tools/execute → Calculator
-   ← {result: 42}
-   ↑ Return to MathAgent
-   
-7. MATH AGENT
-   ↑ Return {result: 42} to Orchestrator
-   
-8. ORCHESTRATOR (Context Enrichment)
-   → Replace "<result_from_step_1>" with 42
-   
-9. ORCHESTRATOR (EXECUTE Step 2)
-   ↓ POST /api/task → MathAgent (square, value: 42)
-   → [MCP flow repeats]
-   ← {result: 1764}
-   
-10. ORCHESTRATOR (AGGREGATE)
-   → Compile results
-   ↑ Return to CLIENT
-   
-11. CLIENT
-   ← {
-       workflow_id: "...",
-       status: "completed",
-       steps_completed: 2,
-       results: [
-         {step: 1, result: 42},
-         {step: 2, result: 1764}
-       ]
-     }
-```
-
----
-
-## MCP Integration
-
-### MCP Architecture
-
-Model Context Protocol (MCP) provides standardized tool integration:
-
-```
-┌─────────────────────┐
-│   MCP Registry      │
-│   - Tool Discovery  │
-│   - Server Tracking │
-└──────────┬──────────┘
-           │
-           ↓
-┌─────────────────────┐
-│   MCP Gateway       │
-│   - Request Routing │
-│   - Tool Selection  │
-│   - Load Balance    │
-└──────────┬──────────┘
-           │
-     ┌─────┴──────┬───────────┬───────────┐
-     ↓            ↓           ↓           ↓
-┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐
-│Calculator│ │Database │ │File Ops │ │Web Srch │
-│ Server   │ │ Server  │ │ Server  │ │ Server  │
-└─────────┘ └─────────┘ └─────────┘ └─────────┘
-```
-
-### Tool Registration
-
-```python
-POST /api/mcp/register
-{
-  "name": "CalculatorServer",
-  "description": "Math operations",
-  "base_url": "http://localhost:8213",
-  "tools": [
-    {
-      "name": "add",
-      "description": "Add two numbers",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "a": {"type": "number"},
-          "b": {"type": "number"}
-        },
-        "required": ["a", "b"]
-      }
-    }
-  ]
-}
-```
-
----
-
-## Workflow Execution
-
-### Execution Modes
-
-#### 1. Sequential Execution
-Steps execute one after another:
-```
-Step 1 → Step 2 → Step 3 → Complete
-```
-
-#### 2. Parallel Execution
-Independent steps execute concurrently:
-```
-Step 1 ────┐
-           ├──→ Step 3 → Complete
-Step 2 ────┘
-```
-
-### Dependency Management
-
-Steps can declare dependencies:
-```python
-{
-  "step_id": "step_3",
-  "dependencies": ["step_1", "step_2"],
-  "capability": "generate_report"
-}
-```
-
-Orchestrator ensures dependencies are met before execution.
-
-### Context Enrichment
-
-Results from previous steps enrich subsequent steps:
-
-```python
-# Step 1 result
-{"result": 42}
-
-# Step 2 parameters (before enrichment)
-{"operation": "square", "value": "<result_from_step_1>"}
-
-# Step 2 parameters (after enrichment)
-{"operation": "square", "value": 42}
-```
-
----
-
-## Scalability & Performance
-
-### Horizontal Scaling
-
-**Stateless Services** (can scale):
-- All agent services
-- MCP tool servers
-- MCP Gateway (with shared registry)
-
-**Stateful Services** (require coordination):
-- Registry (single instance or clustered with shared DB)
-- Orchestrator (single instance per workflow, or shared DB)
-- MCP Registry (single instance or clustered)
-
-### Performance Optimizations
-
-1. **Parallel Execution**: 2-5x speedup for independent steps
-2. **Connection Pooling**: HTTP client reuse
-3. **Circuit Breaker**: Prevent cascading failures
-4. **Retry with Backoff**: Handle transient failures
-5. **Result Caching**: LLM response caching (future)
-
-### Resource Usage
-
-| Service | Memory | CPU | Network |
-|---------|--------|-----|---------|
-| Registry | ~50MB | Low | Medium |
-| Orchestrator | ~100MB | Medium | High |
-| Agents | ~80MB each | Medium | Medium |
-| MCP Services | ~50MB each | Low | Low |
-
----
-
-## Deployment Models
-
-### 1. Single Machine (Development)
-```bash
-./start_services.sh
-# All services on localhost, different ports
-```
-
-### 2. Docker Compose (Testing)
-```bash
-docker-compose up
-# All services in containers, shared network
-```
-
-### 3. Kubernetes (Production)
-```yaml
-# Each service as deployment
-# Service discovery via k8s DNS
-# Ingress for external access
-```
-
----
-
-## Security Considerations
-
-1. **Authentication**: Service-to-service (future: JWT tokens)
-2. **Authorization**: Capability-based access control
-3. **Network**: Internal network for service communication
-4. **Secrets**: AWS credentials via IAM roles or env vars
-5. **Isolation**: Container/process isolation
-6. **Timeouts**: Prevent resource exhaustion
-
----
-
-## Monitoring & Observability
-
-### Metrics
-- Workflow execution time
-- Step success/failure rates
-- Agent availability
-- Tool usage statistics
-- Circuit breaker states
-
-### Logging
-- Structured JSON logs
-- Request/response tracing
-- Error stack traces
-- Performance metrics
-
-### Health Checks
-- Agent heartbeats (30s interval)
-- Service liveness probes
-- Dependency checks
-
----
-
-**Version**: 2.0  
-**Last Updated**: 2026-02-07  
-**Status**: Production Ready
+**Version**: 2.1
+**Last Updated**: 2026-02-13
