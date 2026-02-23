@@ -2,9 +2,7 @@
 Calculator MCP Server
 Provides basic and advanced mathematical operations as MCP tools
 """
-import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel

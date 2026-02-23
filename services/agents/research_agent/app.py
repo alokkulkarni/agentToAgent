@@ -2,9 +2,7 @@
 Research Agent - Standalone Service
 Performs research and information gathering using AWS Bedrock
 """
-import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
@@ -30,6 +28,7 @@ load_dotenv()
 # Configuration
 AGENT_NAME = os.getenv("AGENT_NAME", "ResearchAgent")
 AGENT_PORT = int(os.getenv("AGENT_PORT", "8003"))
+AGENT_HOST = os.getenv("AGENT_HOST", "localhost")
 REGISTRY_URL = os.getenv("REGISTRY_URL", "http://localhost:8000")
 MCP_GATEWAY_URL = os.getenv("MCP_GATEWAY_URL", "http://localhost:8300")
 AWS_REGION = os.getenv("AWS_REGION", "eu-west-2")
@@ -66,7 +65,7 @@ async def register_with_registry():
             )
         ],
         has_llm=True,
-        endpoint=f"http://localhost:{AGENT_PORT}"
+        endpoint=f"http://{AGENT_HOST}:{AGENT_PORT}"
     )
     
     registry_client = A2AClient(REGISTRY_URL)
@@ -147,24 +146,12 @@ Respond with JSON: {"needs_search": true/false, "reason": "..."}"""
 
         user_query = f"Query: {query}"
         
-        try:
-            response = bedrock_client.converse(
-                modelId=BEDROCK_MODEL_ID,
-                system=[{
-                    "text": system_instruction,
-                    "cachePoint": {"type": "default"}
-                }],
-                messages=[{"role": "user", "content": [{"text": user_query}]}],
-                inferenceConfig={"maxTokens": 200, "temperature": 0.1}
-            )
-        except Exception as e:
-            # Fallback for prompt caching
-            response = bedrock_client.converse(
-                modelId=BEDROCK_MODEL_ID,
-                system=[{"text": system_instruction}],
-                messages=[{"role": "user", "content": [{"text": user_query}]}],
-                inferenceConfig={"maxTokens": 200, "temperature": 0.1}
-            )
+        response = bedrock_client.converse(
+            modelId=BEDROCK_MODEL_ID,
+            system=[{"text": system_instruction}],
+            messages=[{"role": "user", "content": [{"text": user_query}]}],
+            inferenceConfig={"maxTokens": 200, "temperature": 0.1}
+        )
         
         content = response['output']['message']['content'][0]['text']
         return "true" in content.lower() and "needs_search" in content.lower()
@@ -304,18 +291,16 @@ async def answer_question(parameters: Dict[str, Any]) -> Dict[str, Any]:
     full_context = f"{context}\n{search_context}" if context else search_context
     
     
-    # Enable Prompt Caching for the context part
-    # We construct the messages structure manually to inject cachePoint
+    # If there is context, prepend it as a separate user message so the LLM
+    # can reference it when answering the question.
     messages = []
     
-    # 1. System/Context Message (Cached)
     if full_context:
         messages.append({
-            "role": "user",  # Context provided as user message part of conversation history
+            "role": "user",
             "content": [
                 {
-                    "text": f"Here is the context data to use for your answer:\n\n{full_context}",
-                    "cachePoint": {"type": "default"}  # Cache this large context block
+                    "text": f"Here is the context data to use for your answer:\n\n{full_context}"
                 }
             ]
         })
@@ -326,29 +311,16 @@ async def answer_question(parameters: Dict[str, Any]) -> Dict[str, Any]:
         "content": [{"text": f"Question: {question}" + ("\n\n(Please incorporate the web search results above to answer this question with up-to-date information.)" if needs_search else "")}]
     })
     
-    # If no context, just use simple message structure (no caching benefit for short prompts)
+    # If no context, just use simple message structure
     if not full_context:
         simple_prompt = f"Question: {question}" + ("\n\n(Please incorporate the web search results above to answer this question with up-to-date information.)" if needs_search else "")
         messages = [{"role": "user", "content": [{"text": simple_prompt}]}]
     
-    try:
-        response = bedrock_client.converse(
-            modelId=BEDROCK_MODEL_ID,
-            messages=messages,
-            inferenceConfig={"maxTokens": 2000, "temperature": 0.7}
-        )
-    except Exception as e:
-        # Fallback - strip cachePoint
-        for msg in messages:
-            for content_block in msg.get("content", []):
-                if "cachePoint" in content_block:
-                    del content_block["cachePoint"]
-        
-        response = bedrock_client.converse(
-            modelId=BEDROCK_MODEL_ID,
-            messages=messages,
-            inferenceConfig={"maxTokens": 2000, "temperature": 0.7}
-        )
+    response = bedrock_client.converse(
+        modelId=BEDROCK_MODEL_ID,
+        messages=messages,
+        inferenceConfig={"maxTokens": 2000, "temperature": 0.7}
+    )
     
     answer = response['output']['message']['content'][0]['text']
     
@@ -365,115 +337,48 @@ async def answer_question(parameters: Dict[str, Any]) -> Dict[str, Any]:
 
 async def generate_report(parameters: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Generate a detailed report
-    
-    ENHANCED: Now supports interactive workflow - can ask user to narrow scope
-    when topic is too broad
+    Generate a detailed report on the given topic.
+    Uses web search if the topic may require up-to-date information.
     """
     topic = parameters.get("topic")
     if not topic:
         raise ValueError("topic parameter is required")
-    
-    # Create interaction helper
+
+    # Create interaction helper (kept for compatibility; user_choice path is still supported)
     helper = AgentInteractionHelper(parameters)
-    
-    aspects = parameters.get("aspects", [])
+
+    aspects = parameters.get("aspects", parameters.get("sections", []))
     aspects_str = ", ".join(aspects) if aspects else "all relevant aspects"
-    
-    # Check if user provided guidance (PRIORITY: Check this first to avoid re-analysis loop)
-    user_choice = helper.get_user_response()
-    
-    if user_choice:
-        print(f"✓ User chose to focus on: {user_choice}")
-        
-        if "Cover all aspects" in user_choice:
-            focus_instruction = "Cover all major aspects comprehensively."
-        else:
-            focus_instruction = f"Focus specifically on: {user_choice}. Provide in-depth coverage of this aspect."
-            
-        # We can skip the scope check if user already decided
-        scope_analysis = "User selected focus area directly."
-        
-    else:
-        # User hasn't decided yet, assess scope
-        # First, assess the scope of the topic
-        scope_prompt = f"""Analyze this research topic and determine:
-    1. Is it too broad for a single comprehensive report?
-    2. What are the main sub-topics or aspects?
-    3. How many sources/perspectives would be needed?
-    
-    Topic: {topic}
-    
-    Respond with JSON containing:
-    - is_broad: boolean
-    - sub_topics: list of main sub-topics
-    - estimated_depth: "shallow", "medium", or "deep"
-    - recommendation: suggested focus area if too broad"""
-        
-        scope_response = bedrock_client.converse(
-            modelId=BEDROCK_MODEL_ID,
-            messages=[{"role": "user", "content": [{"text": scope_prompt}]}],
-            inferenceConfig={"maxTokens": 1000, "temperature": 0.3}
+
+    # Use any pre-existing data / content injected by the orchestrator
+    injected_data = parameters.get("data") or parameters.get("content") or ""
+    if isinstance(injected_data, dict):
+        # If it's a structured result dict, extract the summary/answer/report
+        injected_data = (
+            injected_data.get("summary")
+            or injected_data.get("answer")
+            or injected_data.get("report")
+            or str(injected_data)
         )
-        
-        scope_analysis = scope_response['output']['message']['content'][0]['text']
-        
-        # Check if topic is too broad
-        is_broad = "is_broad\": true" in scope_analysis or "is_broad\":true" in scope_analysis
-        
-        # INTERACTIVE WORKFLOW: Ask user to narrow scope if topic is too broad
-        if is_broad:
-            # Try to extract sub-topics (simplified)
-            import re
-            subtopics_match = re.search(r'"sub_topics":\s*\[(.*?)\]', scope_analysis, re.DOTALL)
-            subtopics = []
-            if subtopics_match:
-                # Extract quoted strings
-                subtopics = re.findall(r'"([^"]+)"', subtopics_match.group(1))
-            
-            if subtopics and len(subtopics) > 1:
-                # Offer specific sub-topics
-                options = subtopics[:5] + ["Cover all aspects (comprehensive report)"]
-            else:
-                # Generic options
-                options = [
-                    "Focus on current trends and developments",
-                    "Focus on historical context and evolution",
-                    "Focus on practical applications and use cases",
-                    "Focus on challenges and future outlook",
-                    "Cover all aspects (comprehensive report)"
-                ]
-            
-            return helper.ask_single_choice(
-                question=f"The topic '{topic}' is quite broad. Which aspect should I focus on?",
-                options=options,
-                reasoning=f"Broad topic detected. Focusing on a specific aspect will produce a more detailed and useful report. Scope analysis: {scope_analysis[:200]}...",
-                partial_results={"scope_analysis": scope_analysis}
-            )
-            
-        focus_instruction = "Cover the topic comprehensively."
-    
-    # Check if search is needed for the topic
+
+    # Check if search is needed for fresh data
     needs_search = await check_if_search_needed(topic)
     search_context = ""
-    
     if needs_search:
         print(f"      💡 Topic requires fresh data. Initiating web search...")
-        # Search for main topic
         search_context = await perform_web_research(topic)
-        
-        # If user chose a specific aspect, search for that too
-        if user_choice and "Cover all" not in user_choice:
-             search_context += await perform_web_research(f"{topic} {user_choice}")
 
-    # Generate the report with user's focus
+    # Build prompt, incorporating any injected data and search context
+    supplementary = ""
+    if injected_data:
+        supplementary += f"\n\nPREVIOUSLY GATHERED RESEARCH:\n{injected_data[:3000]}"
+    if search_context:
+        supplementary += f"\n\nWEB SEARCH RESULTS:\n{search_context}"
+
     prompt = f"""Generate a comprehensive report on: {topic}
 
-{focus_instruction}
-
-Include {aspects_str}.
-
-{search_context}
+Focus: {aspects_str}.
+{supplementary}
 
 Structure the report with:
 1. Executive Summary
@@ -481,33 +386,24 @@ Structure the report with:
 3. Detailed Analysis
 4. Conclusions and Recommendations
 
-Make it detailed and well-researched. If web search results are provided, use them to ensure the information is current."""
-    
+Make it detailed and well-researched.{' Use the web search results and previous research above to ensure accuracy and currency.' if (search_context or injected_data) else ''}"""
+
     response = bedrock_client.converse(
         modelId=BEDROCK_MODEL_ID,
         messages=[{"role": "user", "content": [{"text": prompt}]}],
         inferenceConfig={"maxTokens": 4000, "temperature": 0.7}
     )
-    
+
     report = response['output']['message']['content'][0]['text']
-    
-    # Calculate tokens (handle case where scope_response might be undefined)
-    input_tokens = response['usage'].get('inputTokens', 0)
-    output_tokens = response['usage'].get('outputTokens', 0)
-    
-    if 'scope_response' in locals():
-        input_tokens += scope_response['usage'].get('inputTokens', 0)
-        output_tokens += scope_response['usage'].get('outputTokens', 0)
-    
+
     return {
         "topic": topic,
         "report": report,
-        "focus_area": user_choice if user_choice else "comprehensive",
-        "scope_analysis": scope_analysis,
+        "focus_area": aspects_str,
         "search_performed": needs_search,
         "llm_usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens
+            "input_tokens": response['usage'].get('inputTokens', 0),
+            "output_tokens": response['usage'].get('outputTokens', 0)
         }
     }
 

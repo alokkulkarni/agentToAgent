@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=67", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# ---------------------------------------------------------------------------
+# Package metadata
+# ---------------------------------------------------------------------------
+[project]
+name = "a2a-shared"
+version = "1.0.0"
+description = "Shared utilities for the A2A agent framework (protocol, config, guardrails, security, audit, vector memory, distributed state)"
+requires-python = ">=3.11"
+
+# Core runtime deps that every consumer of this package will need.
+# Service-specific extras (redis, psycopg2, vector backends, etc.) are declared
+# in each service's own requirements.txt and should NOT be required here.
+dependencies = [
+    "pydantic>=2.0",
+    "python-dotenv>=1.0",
+    "boto3>=1.35",
+    "botocore>=1.35",
+    "httpx>=0.24",
+    "PyJWT[crypto]>=2.8",
+    "cryptography>=41",
+    "structlog>=24",
+]
+
+# ---------------------------------------------------------------------------
+# Setuptools: find the `shared` package in the PARENT directory of this file.
+#
+# When pip is told  `pip install ./shared`  the project root becomes the `shared/`
+# directory.  Setting `where = [".."]` tells setuptools to look one level up
+# (the repo root) for packages to include.  It finds `shared/` there and installs
+# it as the `shared` Python namespace — so  `import shared.config`  etc. all
+# continue to work with zero import-statement changes in any service.
+# ---------------------------------------------------------------------------
+[tool.setuptools.packages.find]
+where = [".."]
+include = ["shared", "shared.*"]
+
+# Include the JSON config files so they are accessible at runtime via
+# importlib.resources or a direct __file__-relative open().
+[tool.setuptools.package-data]
+"shared" = ["config/*.json"]

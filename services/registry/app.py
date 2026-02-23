@@ -2,9 +2,7 @@
 Registry Service - Standalone Agent Registry
 FastAPI service for agent discovery and registration
 """
-import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse

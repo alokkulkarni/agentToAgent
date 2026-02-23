@@ -196,3 +196,86 @@ docker push $ACR_URL/agentic/registry:latest
 *   Since the agents run in Azure but call AWS Bedrock:
     1.  Ensure egress traffic to `bedrock-runtime.us-east-1.amazonaws.com` is allowed in NSG/Firewall.
     2.  Recommended: Create an **AWS IAM User** dedicated to this Azure workload with specific `bedrock:InvokeModel` permissions. Rotate keys regularly or use OIDC federation (Azure AD -> AWS IAM) to avoid long-lived keys.
+
+### 4.5. Vector Memory Store Configuration
+
+The orchestrator ships with a pluggable vector memory backend. For Azure deployments, two native options are recommended:
+
+#### Option A: Azure AI Search (recommended for keyword + semantic hybrid search)
+```bash
+# Create Azure AI Search service
+az search service create \
+  --name agentic-search \
+  --resource-group $RESOURCE_GROUP \
+  --location $LOCATION \
+  --sku basic
+
+# Get admin key (or use Managed Identity — omit AZURE_SEARCH_API_KEY)
+AZURE_SEARCH_KEY=$(az search admin-key show \
+  --service-name agentic-search \
+  --resource-group $RESOURCE_GROUP \
+  --query primaryKey -o tsv)
+```
+Set on orchestrator container/pod:
+```
+VECTOR_MEMORY_ENABLED=true
+VECTOR_MEMORY_BACKEND=azure_ai_search
+VECTOR_MEMORY_EMBEDDING=bedrock          # or openai / sentence_transformers
+AZURE_SEARCH_ENDPOINT=https://agentic-search.search.windows.net
+AZURE_SEARCH_API_KEY=<admin-key>         # omit if using Managed Identity
+AZURE_SEARCH_INDEX=a2a-memories
+AZURE_SEARCH_VECTOR_DIM=1536
+```
+Store `AZURE_SEARCH_API_KEY` in **Key Vault** and reference it via Key Vault Reference (ACA) or CSI Secret Store Driver (AKS). Managed Identity is preferred — omit the key entirely.
+
+#### Option B: Azure Cosmos DB — DiskANN (recommended if already using Cosmos DB for session state)
+```bash
+# Create Cosmos DB account with vector search enabled
+az cosmosdb create \
+  --name agentic-cosmos \
+  --resource-group $RESOURCE_GROUP \
+  --locations regionName=$LOCATION \
+  --capabilities EnableNoSQLVectorSearch
+
+# Cosmos DB connection string (or use Managed Identity — omit COSMOS_KEY)
+COSMOS_KEY=$(az cosmosdb keys list \
+  --name agentic-cosmos \
+  --resource-group $RESOURCE_GROUP \
+  --query primaryMasterKey -o tsv)
+```
+Set on orchestrator container/pod:
+```
+VECTOR_MEMORY_ENABLED=true
+VECTOR_MEMORY_BACKEND=azure_cosmos
+VECTOR_MEMORY_EMBEDDING=bedrock
+COSMOS_ENDPOINT=https://agentic-cosmos.documents.azure.com:443/
+COSMOS_KEY=<primary-key>                 # omit if using Managed Identity
+COSMOS_DATABASE=a2a_agent_memory
+COSMOS_CONTAINER=agent_memories
+COSMOS_VECTOR_POLICY=diskANN
+```
+Store `COSMOS_KEY` in **Key Vault**. For Managed Identity, assign the **Cosmos DB Built-in Data Contributor** role to the Container App / AKS pod identity.
+
+#### Managed Identity (passwordless) — both backends
+```bash
+# Assign identity to Container App
+az containerapp identity assign \
+  --name orchestrator \
+  --resource-group $RESOURCE_GROUP \
+  --system-assigned
+
+# Azure AI Search — assign Search Index Data Contributor role
+az role assignment create \
+  --assignee <PRINCIPAL_ID> \
+  --role "Search Index Data Contributor" \
+  --scope /subscriptions/<SUB_ID>/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Search/searchServices/agentic-search
+
+# Cosmos DB — assign Built-in Data Contributor role
+az cosmosdb sql role assignment create \
+  --account-name agentic-cosmos \
+  --resource-group $RESOURCE_GROUP \
+  --role-definition-id 00000000-0000-0000-0000-000000000002 \
+  --principal-id <PRINCIPAL_ID> \
+  --scope /subscriptions/<SUB_ID>/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.DocumentDB/databaseAccounts/agentic-cosmos
+```
+With Managed Identity assigned, omit `AZURE_SEARCH_API_KEY` / `COSMOS_KEY` entirely — `DefaultAzureCredential` is used automatically.

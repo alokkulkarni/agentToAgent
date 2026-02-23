@@ -74,6 +74,39 @@ class ComplianceConfig:
 
 
 @dataclass
+class AuthConfig:
+    """Authentication and Identity Provider configuration"""
+    enabled: bool = False
+    provider: str = "none"  # azure_ad, okta, auth0, aws_cognito, keycloak, generic_oidc, none
+    issuer: str = ""
+    audience: str = ""
+    client_id: str = ""
+    client_secret: str = ""
+    jwks_uri: str = ""
+    token_endpoint: str = ""
+    authorize_endpoint: str = ""
+    discovery_url: str = ""  # Auto-discover endpoints from .well-known/openid-configuration
+    validate_signature: bool = True
+    validate_expiry: bool = True
+    algorithms: List[str] = field(default_factory=lambda: ["RS256"])
+    default_scopes: List[str] = field(default_factory=lambda: ["openid", "profile", "email"])
+    role_claim: str = "roles"
+    tenant_claim: str = "tenant_id"
+
+
+@dataclass
+class VectorMemoryConfig:
+    """Vector memory store configuration for long-term agent recall"""
+    enabled: bool = False
+    backend: str = "in_memory"         # in_memory | chromadb | pinecone | qdrant | weaviate | pgvector | redis
+    embedding_provider: str = "bedrock"  # bedrock | openai | sentence_transformers | none
+    collection_name: str = "a2a_memories"
+    top_k: int = 5
+    score_threshold: float = 0.3
+    max_entries: int = 1000
+
+
+@dataclass
 class LLMConfig:
     """LLM provider configuration"""
     default_model: str = "anthropic.claude-3-sonnet-20240229-v1:0"
@@ -194,6 +227,8 @@ class ConfigManager:
         self.deployment_id: str = "default"
         self.feature_flags: FeatureFlags = FeatureFlags()
         self.compliance: ComplianceConfig = ComplianceConfig()
+        self.auth: AuthConfig = AuthConfig()
+        self.vector_memory: VectorMemoryConfig = VectorMemoryConfig()
         self.llm: LLMConfig = LLMConfig()
         self.session: SessionConfig = SessionConfig()
         self.rate_limit: RateLimitConfig = RateLimitConfig()
@@ -467,6 +502,38 @@ class ConfigManager:
             if os.getenv(port_env):
                 self._services[service_name].port = int(os.getenv(port_env))
         
+        # Auth
+        if os.getenv("AUTH_ENABLED"):
+            self.auth.enabled = os.getenv("AUTH_ENABLED", "false").lower() == "true"
+        if os.getenv("AUTH_PROVIDER"):
+            self.auth.provider = os.getenv("AUTH_PROVIDER")
+        if os.getenv("AUTH_ISSUER"):
+            self.auth.issuer = os.getenv("AUTH_ISSUER")
+        if os.getenv("AUTH_AUDIENCE"):
+            self.auth.audience = os.getenv("AUTH_AUDIENCE")
+        if os.getenv("AUTH_CLIENT_ID"):
+            self.auth.client_id = os.getenv("AUTH_CLIENT_ID")
+        if os.getenv("AUTH_CLIENT_SECRET"):
+            self.auth.client_secret = os.getenv("AUTH_CLIENT_SECRET")
+        if os.getenv("AUTH_DISCOVERY_URL"):
+            self.auth.discovery_url = os.getenv("AUTH_DISCOVERY_URL")
+
+        # Vector Memory Store
+        if os.getenv("VECTOR_MEMORY_ENABLED"):
+            self.vector_memory.enabled = os.getenv("VECTOR_MEMORY_ENABLED", "false").lower() == "true"
+        if os.getenv("VECTOR_MEMORY_BACKEND"):
+            self.vector_memory.backend = os.getenv("VECTOR_MEMORY_BACKEND")
+        if os.getenv("VECTOR_MEMORY_EMBEDDING"):
+            self.vector_memory.embedding_provider = os.getenv("VECTOR_MEMORY_EMBEDDING")
+        if os.getenv("VECTOR_MEMORY_COLLECTION"):
+            self.vector_memory.collection_name = os.getenv("VECTOR_MEMORY_COLLECTION")
+        if os.getenv("VECTOR_MEMORY_TOP_K"):
+            self.vector_memory.top_k = int(os.getenv("VECTOR_MEMORY_TOP_K"))
+        if os.getenv("VECTOR_MEMORY_SCORE_THRESHOLD"):
+            self.vector_memory.score_threshold = float(os.getenv("VECTOR_MEMORY_SCORE_THRESHOLD"))
+        if os.getenv("VECTOR_MEMORY_MAX_ENTRIES"):
+            self.vector_memory.max_entries = int(os.getenv("VECTOR_MEMORY_MAX_ENTRIES"))
+
         # Agent overrides
         agent_env_prefix = {
             "code_analyzer": "CODE_ANALYZER",

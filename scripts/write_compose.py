@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""Rewrite docker-compose.yml to use per-service env_file directives."""
+import os
+
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+COMPOSE = """\
+version: '3.8'
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Registry Service — central agent registry (starts first)
+  # ---------------------------------------------------------------------------
+  registry:
+    build:
+      context: .
+      dockerfile: services/registry/Dockerfile
+    env_file: services/registry/.env
+    ports:
+      - "8000:8000"
+    networks:
+      - a2a-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # MCP Registry — MCP server registry
+  # ---------------------------------------------------------------------------
+  mcp-registry:
+    build:
+      context: .
+      dockerfile: services/mcp_registry/Dockerfile
+    env_file: services/mcp_registry/.env
+    ports:
+      - "8200:8200"
+    depends_on:
+      registry:
+        condition: service_healthy
+    networks:
+      - a2a-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8200/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Redis — shared state backend for HA multi-instance orchestrator
+  # Set HA_BACKEND=redis in services/orchestrator/.env to activate
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - a2a-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Orchestrator Service
+  # ---------------------------------------------------------------------------
+  orchestrator:
+    build:
+      context: .
+      dockerfile: services/orchestrator/Dockerfile
+    env_file: services/orchestrator/.env
+    ports:
+      - "8100:8100"
+    volumes:
+      - ${HOME}/.aws:/root/.aws:ro
+      - workflow-data:/app/data
+    depends_on:
+      registry:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - a2a-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8100/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # MCP Servers (after MCP Registry)
+  # ---------------------------------------------------------------------------
+
+  calculator-server:
+    build:
+      context: .
+      dockerfile: services/mcp_servers/calculator/Dockerfile
+    env_file: services/mcp_servers/calculator/.env
+    ports:
+      - "8213:8213"
+    depends_on:
+      mcp-registry:
+        condition: service_healthy
+    networks:
+      - a2a-network
+    restart: unless-stopped
+
+  database-server:
+    build:
+      context: .
+      dockerfile: services/mcp_servers/database/Dockerfile
+    env_file: services/mcp_servers/database/.env
+    ports:
+      - "8211:8211"
+    depends_on:
+      mcp-registry:
+        condition: service_healthy
+    networks:
+      - a2a-network
+    volumes:
+      - database-data:/tmp
+    restart: unless-stopped
+
+  file-ops-server:
+    build:
+      context: .
+      dockerfile: services/mcp_servers/file_ops/Dockerfile
+    env_file: services/mcp_servers/file_ops/.env
+    ports:
+      - "8210:8210"
+    depends_on:
+      mcp-registry:
+        condition: service_healthy
+    networks:
+      - a2a-network
+    volumes:
+      - workspace-data:/tmp/mcp_workspace
+    restart: unless-stopped
+
+  web-search-server:
+    build:
+      context: .
+      dockerfile: services/mcp_servers/web_search/Dockerfile
+    env_file: services/mcp_servers/web_search/.env
+    ports:
+      - "8212:8212"
+    depends_on:
+      mcp-registry:
+        condition: service_healthy
+    networks:
+      - a2a-network
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # MCP Gateway (after all MCP servers)
+  # ---------------------------------------------------------------------------
+  mcp-gateway:
+    build:
+      context: .
+      dockerfile: services/mcp_gateway/Dockerfile
+    env_file: services/mcp_gateway/.env
+    ports:
+      - "8300:8300"
+    volumes:
+      - ${HOME}/.aws:/root/.aws:ro
+    depends_on:
+      - mcp-registry
+      - calculator-server
+      - database-server
+      - file-ops-server
+      - web-search-server
+    networks:
+      - a2a-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8300/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # Agent Services (after Registry + MCP Gateway)
+  # ---------------------------------------------------------------------------
+
+  code-analyzer:
+    build:
+      context: .
+      dockerfile: services/agents/code_analyzer/Dockerfile
+    env_file: services/agents/code_analyzer/.env
+    ports:
+      - "8001:8001"
+    volumes:
+      - ${HOME}/.aws:/root/.aws:ro
+    depends_on:
+      registry:
+        condition: service_healthy
+    networks:
+      - a2a-network
+    restart: unless-stopped
+
+  data-processor:
+    build:
+      context: .
+      dockerfile: services/agents/data_processor/Dockerfile
+    env_file: services/agents/data_processor/.env
+    ports:
+      - "8002:8002"
+    volumes:
+      - ${HOME}/.aws:/root/.aws:ro
+    depends_on:
+      registry:
+        condition: service_healthy
+    networks:
+      - a2a-network
+    restart: unless-stopped
+
+  research-agent:
+    build:
+      context: .
+      dockerfile: services/agents/research_agent/Dockerfile
+    env_file: services/agents/research_agent/.env
+    ports:
+      - "8003:8003"
+    volumes:
+      - ${HOME}/.aws:/root/.aws:ro
+    depends_on:
+      registry:
+        condition: service_healthy
+    networks:
+      - a2a-network
+    restart: unless-stopped
+
+  task-executor:
+    build:
+      context: .
+      dockerfile: services/agents/task_executor/Dockerfile
+    env_file: services/agents/task_executor/.env
+    ports:
+      - "8004:8004"
+    depends_on:
+      registry:
+        condition: service_healthy
+    networks:
+      - a2a-network
+    restart: unless-stopped
+
+  observer:
+    build:
+      context: .
+      dockerfile: services/agents/observer/Dockerfile
+    env_file: services/agents/observer/.env
+    ports:
+      - "8005:8005"
+    depends_on:
+      registry:
+        condition: service_healthy
+    networks:
+      - a2a-network
+    restart: unless-stopped
+
+  math-agent:
+    build:
+      context: .
+      dockerfile: services/agents/math_agent/Dockerfile
+    env_file: services/agents/math_agent/.env
+    ports:
+      - "8006:8006"
+    depends_on:
+      registry:
+        condition: service_healthy
+      mcp-gateway:
+        condition: service_started
+    networks:
+      - a2a-network
+    restart: unless-stopped
+
+networks:
+  a2a-network:
+    driver: bridge
+
+volumes:
+  database-data:
+    driver: local
+  workspace-data:
+    driver: local
+  workflow-data:
+    driver: local
+  redis-data:
+    driver: local
+"""
+
+path = os.path.join(BASE, "docker-compose.yml")
+with open(path, "w") as f:
+    f.write(COMPOSE)
+print(f"Written: {path}")

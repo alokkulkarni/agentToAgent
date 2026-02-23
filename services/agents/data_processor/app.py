@@ -2,9 +2,7 @@
 Data Processor Agent - Standalone Service
 Processes and analyzes data using AWS Bedrock
 """
-import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
@@ -29,6 +27,7 @@ load_dotenv()
 # Configuration
 AGENT_NAME = os.getenv("AGENT_NAME", "DataProcessor")
 AGENT_PORT = int(os.getenv("AGENT_PORT", "8002"))
+AGENT_HOST = os.getenv("AGENT_HOST", "localhost")
 REGISTRY_URL = os.getenv("REGISTRY_URL", "http://localhost:8000")
 AWS_REGION = os.getenv("AWS_REGION", "eu-west-2")
 BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20241022-v2:0")
@@ -63,7 +62,7 @@ async def register_with_registry():
             )
         ],
         has_llm=True,
-        endpoint=f"http://localhost:{AGENT_PORT}"
+        endpoint=f"http://{AGENT_HOST}:{AGENT_PORT}"
     )
     
     registry_client = A2AClient(REGISTRY_URL)

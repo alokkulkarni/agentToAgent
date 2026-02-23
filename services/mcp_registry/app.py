@@ -15,7 +15,7 @@ import uvicorn
 # Environment Configuration
 REGISTRY_HOST = os.getenv("MCP_REGISTRY_HOST", "0.0.0.0")
 REGISTRY_PORT = int(os.getenv("MCP_REGISTRY_PORT", "8200"))
-LOG_LEVEL = os.getenv("LOG_LEVEL", "info")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "info").lower()
 
 
 # Models
@@ -208,6 +208,42 @@ async def find_tool(tool_name: str):
         "tool_name": tool_name,
         "servers_available": len(servers),
         "servers": servers
+    }
+
+
+@app.get("/api/mcp/tools/{tool_name}/auth")
+async def get_tool_auth_requirements(tool_name: str):
+    """Get authentication requirements for a specific tool"""
+    if tool_name not in tools_index:
+        raise HTTPException(status_code=404, detail=f"Tool '{tool_name}' not found")
+    
+    server_ids = tools_index[tool_name]
+    
+    # Get auth schema from first server that provides this tool
+    for server_id in server_ids:
+        if server_id in mcp_servers:
+            server = mcp_servers[server_id]
+            # Find the specific tool with auth schema
+            for tool in server.tools:
+                if tool.name == tool_name:
+                    # Check if the tool has auth_schema attribute
+                    tool_dict = tool.dict() if hasattr(tool, 'dict') else tool.__dict__
+                    auth_schema = tool_dict.get("auth_schema")
+                    if auth_schema:
+                        return {
+                            "tool_name": tool_name,
+                            "server_id": server.server_id,
+                            "server_name": server.name,
+                            "auth_schema": auth_schema
+                        }
+    
+    # No auth required by default
+    return {
+        "tool_name": tool_name,
+        "auth_schema": {
+            "auth_type": "none",
+            "required_scopes": []
+        }
     }
 
 

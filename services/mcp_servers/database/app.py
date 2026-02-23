@@ -20,7 +20,7 @@ SERVER_HOST = os.getenv("MCP_DATABASE_HOST", "0.0.0.0")
 SERVER_PORT = int(os.getenv("MCP_DATABASE_PORT", "8211"))
 MCP_REGISTRY_URL = os.getenv("MCP_REGISTRY_URL", "http://localhost:8200")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "/tmp/mcp_database.db")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "info")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "info").lower()
 
 
 # Models

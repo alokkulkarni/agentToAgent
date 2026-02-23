@@ -145,6 +145,24 @@ data:
   REDIS_HOST: "<YOUR_ELASTICACHE_ENDPOINT>"
   REDIS_PORT: "6379"
   LOG_LEVEL: "INFO"
+  # ── Vector Memory Store ────────────────────────────────────────────────────
+  # Option A: disabled (safe default)
+  VECTOR_MEMORY_ENABLED: "false"
+  VECTOR_MEMORY_BACKEND: "in_memory"
+  VECTOR_MEMORY_EMBEDDING: "bedrock"
+  VECTOR_MEMORY_COLLECTION: "a2a_memories"
+  VECTOR_MEMORY_TOP_K: "5"
+  VECTOR_MEMORY_SCORE_THRESHOLD: "0.3"
+  BEDROCK_EMBED_MODEL: "amazon.titan-embed-text-v1"
+  # Option B: AWS OpenSearch Service (recommended for AWS deployments)
+  # VECTOR_MEMORY_ENABLED: "true"
+  # VECTOR_MEMORY_BACKEND: "opensearch_aws"
+  # OPENSEARCH_HOST: "https://search-<name>-<id>.us-east-1.es.amazonaws.com"
+  # OPENSEARCH_SERVICE: "es"        # es = managed domain, aoss = serverless
+  # OPENSEARCH_REGION: "us-east-1"
+  # OPENSEARCH_INDEX: "a2a-memories"
+  # OPENSEARCH_VECTOR_DIM: "1536"
+  # Note: Auth uses SigV4 automatically from the pod's IAM role — no extra secrets.
 ```
 
 Create `k8s/secrets.yaml` (Replace with actual keys):
@@ -159,8 +177,33 @@ stringData:
   AWS_ACCESS_KEY_ID: "..."
   AWS_SECRET_ACCESS_KEY: "..."
   BEDROCK_REGION: "us-east-1"
+  # Vector memory secrets — only needed if NOT using IAM role (pod identity)
+  # OPENSEARCH_USER: "admin"           # basic auth fallback only
+  # OPENSEARCH_PASSWORD: "..."
+  # PINECONE_API_KEY: "pc-..."         # if using Pinecone instead
 ```
 Apply: `kubectl apply -f k8s/config-env.yaml -f k8s/secrets.yaml`
+
+#### IAM Policy — OpenSearch vector memory (EKS IRSA / EC2 instance profile)
+If using `VECTOR_MEMORY_BACKEND=opensearch_aws`, attach this policy to the orchestrator pod's service account role:
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": [
+      "es:ESHttpGet",
+      "es:ESHttpPost",
+      "es:ESHttpPut",
+      "es:ESHttpDelete",
+      "es:ESHttpHead"
+    ],
+    "Resource": "arn:aws:es:<REGION>:<ACCOUNT_ID>:domain/<DOMAIN_NAME>/*"
+  }]
+}
+```
+For OpenSearch Serverless (`OPENSEARCH_SERVICE=aoss`), replace `es:ESHttp*` with `aoss:APIAccessAll`.
+The orchestrator authenticates via SigV4 using the pod's IAM role — **no hardcoded keys required**.
 
 ### 2.3. Service Deployments
 Create YAML files for each service.

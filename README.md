@@ -16,26 +16,44 @@ A generic, extensible framework for autonomous multi-agent collaboration using *
 *   **⚡ Performance**: Parallel execution, prompt caching, and exponential backoff retries.
 
 ```ascii
-      [ USER / CLI ]
-            |
-            v
-    +----------------+       +-------------------+
-    |  ORCHESTRATOR  |<----->|  CONTEXT & STATE  |
-    +-------+--------+       +-------------------+
-            |
-            | (Plan & Delegate)
-            v
-    +----------------+       +-------------------+
-    |   AGENT MESH   |<----->|  SECURITY LAYER   |
-    | (Research,Math)|       | (Guardrails/PII)  |
-    +-------+--------+       +-------------------+
-            |
-            | (Tool Call)
-            v
-    +----------------+       +-------------------+
-    |   MCP GATEWAY  |------>|   MCP SERVERS     |
-    +----------------+       | (Search, Calc...) |
-                             +-------------------+
+                    +---------------------------+
+                    |    IDENTITY PROVIDER      |
+                    | (Azure AD / Okta / Auth0  |
+                    |  Cognito / Keycloak / OIDC)|
+                    +------------+--------------+
+                                 | JWT Validation /
+                                 | Token Issuance
+      [ USER / CLI ]             |
+            | (Bearer JWT)       |
+            v                    v
+    +------------------+  Validate   +-------------------+
+    |   ORCHESTRATOR   |<----------->|   AUTH MODULE     |
+    |   (Port 8100)    |    Token    | (identity_provider|
+    +--------+---------+             |  .py + JWKS)      |
+             |                      +-------------------+
+             | (Plan & Delegate +         |
+             |  User Context)             | OBO Token
+             v                           | Exchange
+    +------------------+  +------------------+
+    |   AGENT MESH     |  |  SECURITY LAYER  |
+    | (Research, Math, |  | (Guardrails/PII/ |
+    |  Code, Data...)  |  |  Audit Logging)  |
+    +--------+---------+  +------------------+
+             |
+             | (Tool Call + User Token)
+             v
+    +------------------+  Auth Schema  +-------------------+
+    |   MCP GATEWAY    |<------------->|   MCP REGISTRY    |
+    |   (Port 8300)    |  Fetch/Verify | (Tool Auth Reqs)  |
+    +--------+---------+               +-------------------+
+             |
+             | (Tool-Scoped Token via OBO)
+             v
+    +--------------------------------------+
+    |           MCP SERVERS                |
+    | (Web Search / Calculator / File Ops  |
+    |  Database / Custom Tools...)         |
+    +--------------------------------------+
 ```
 
 ---
@@ -101,6 +119,72 @@ All actions are logged to `logs/audit_chain.json`.
 *   **Format**: JSON-structured logs with cryptographic chaining (hash of previous entry).
 *   **Content**: "Thought", "Plan", "Observation", "Action".
 
+### 4. Identity Provider Integration (Enterprise Authentication)
+The framework supports integration with multiple identity providers for JWT-based authentication and authorization.
+
+#### Supported Identity Providers
+*   **Azure AD (Microsoft Entra ID)**
+*   **Okta**
+*   **Auth0**
+*   **AWS Cognito**
+*   **Keycloak**
+*   **Any OIDC-compliant provider**
+
+#### Quick Setup
+```bash
+# 1. Install authentication dependencies
+pip install PyJWT[crypto] cryptography httpx
+
+# 2. Configure your identity provider in .env
+AUTH_ENABLED=true
+AUTH_PROVIDER=azure_ad  # or okta, auth0, cognito, keycloak, oidc
+AUTH_ISSUER=https://login.microsoftonline.com/{tenant-id}/v2.0
+AUTH_AUDIENCE=api://{your-api-client-id}
+AUTH_CLIENT_ID={your-client-id}
+AUTH_CLIENT_SECRET={your-client-secret}
+
+# 3. Test your setup
+python scripts/test_identity_provider.py
+```
+
+#### Features
+*   **JWT Token Validation**: RS256/HS256 signature verification with JWKS auto-discovery
+*   **Role-Based Access Control (RBAC)**: Enforce roles on endpoints
+*   **Scope-Based Access Control**: Fine-grained permissions via OAuth scopes
+*   **On-Behalf-Of (OBO) Token Exchange**: Automatically exchange user tokens for tool-specific tokens
+*   **Token Caching**: Performance optimization with automatic expiry handling
+*   **MCP Tool Authentication**: MCP servers can declare authentication requirements; gateway handles token exchange
+
+#### API Usage
+```bash
+# Get JWT token from your identity provider
+TOKEN=$(curl -X POST https://your-idp.com/oauth2/token \
+  -d grant_type=client_credentials \
+  -d client_id=your-client-id \
+  -d client_secret=your-client-secret \
+  -d scope=api.access | jq -r .access_token)
+
+# Use token to execute workflow
+curl -X POST http://localhost:8100/api/workflow/execute \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"task_description": "Analyze sales data"}'
+```
+
+#### Documentation
+*   **[Identity Provider Setup Guide](docs/IDENTITY_PROVIDER_SETUP.md)**: Detailed configuration for each IdP
+*   **[Identity Integration Summary](docs/IDENTITY_INTEGRATION_SUMMARY.md)**: Architecture and features overview
+*   **Setup Script**: `./scripts/setup_identity_provider.sh` - Automated setup helper
+*   **Test Script**: `./scripts/test_identity_provider.py` - Verify your configuration
+
+#### Development Mode
+For local development, you can disable authentication:
+```bash
+# In .env
+AUTH_ENABLED=false
+```
+This allows testing without configuring an identity provider.
+
 ---
 
 ## 📚 Documentation
@@ -143,5 +227,5 @@ python tests/test_websocket_interactive.py
 
 ---
 
-**Version**: 2.1
-**Last Updated**: 2026-02-13
+**Version**: 2.2
+**Last Updated**: 2026-02-23

@@ -2,11 +2,9 @@
 Orchestrator Service - Standalone Orchestration Service
 Coordinates multi-agent workflows using A2A protocol
 """
-import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from typing import Dict, Any, List, Optional
@@ -27,10 +25,14 @@ from shared.config import EnterpriseConfig
 from shared.guardrails import GuardrailService
 from shared.audit import AuditLogger
 from shared.security import SecurityManager
+from shared.identity_provider import get_identity_provider, UserContext
+from shared.auth_dependencies import get_current_user, get_user_headers
+from shared.vector_memory import get_vector_memory, VectorMemoryStore
+from shared.distributed_state import get_distributed_state, DistributedState
 try:
-    from models import WorkflowRecord, WorkflowStatus
+    from models import WorkflowRecord, WorkflowStatus, StepRecord, StepStatus
 except ImportError:
-    from .models import WorkflowRecord, WorkflowStatus
+    from .models import WorkflowRecord, WorkflowStatus, StepRecord, StepStatus  # type: ignore
 
 load_dotenv()
 
@@ -38,6 +40,11 @@ load_dotenv()
 guardrails = GuardrailService()
 audit_logger = AuditLogger()
 security_manager = SecurityManager()
+identity_provider = get_identity_provider()
+vector_memory = get_vector_memory()
+# Distributed state (replaces per-process active_workflows dict and session_store).
+# Backed by Redis in HA mode (HA_BACKEND=redis) or in-memory for single-node dev.
+dist_state: DistributedState = get_distributed_state()
 
 
 async def enrich_with_workflow_context(
@@ -75,7 +82,42 @@ async def enrich_with_workflow_context(
         print(f"         ✓ Injected {len(session_history)} session history items into context")
             
     print(f"      🔗 Context enrichment for '{capability}'...")
-    
+
+    # Strategy -1: Resolve {{step_id.result}} / {{step_id.anything}} mustache templates
+    # The LLM often uses this syntax to reference prior steps by their plan-assigned id.
+    import re as _re
+    _mustache = _re.compile(r'\{\{([\w]+)\.([\w]+)\}\}')
+
+    def _resolve_mustache(value):
+        """Replace all {{id.field}} occurrences in a string with the actual result."""
+        if not isinstance(value, str):
+            return value
+        def _sub(m):
+            ref_id, ref_field = m.group(1), m.group(2)
+            # 1. Look up by plan step id or step_N key in step_results
+            entry = step_results.get(ref_id)
+            if entry is None:
+                # 2. Try capability_outputs keyed by capability name
+                cap_val = capability_outputs.get(ref_id)
+                if cap_val is not None:
+                    result = cap_val
+                    if isinstance(result, dict):
+                        return str(result.get(ref_field, result.get('result', result.get('answer', str(result)))))
+                    return str(result)
+                return m.group(0)  # leave unresolved template as-is
+            result = entry.get('result', '')
+            if isinstance(result, dict):
+                return str(result.get(ref_field, result.get('result', result.get('answer', str(result)))))
+            return str(result)
+        return _mustache.sub(_sub, value)
+
+    for key, value in list(enriched.items()):
+        if isinstance(value, str) and '{{' in value:
+            resolved = _resolve_mustache(value)
+            if resolved != value:
+                enriched[key] = resolved
+                print(f"         ✓ Resolved mustache template in '{key}'")
+
     # Strategy 0: Generic template replacement for <result_from_step_N> and <output from step N>
     import re
     
@@ -347,6 +389,7 @@ async def enrich_with_workflow_context(
 # Configuration
 ORCHESTRATOR_NAME = os.getenv("ORCHESTRATOR_NAME", "MainOrchestrator")
 ORCHESTRATOR_PORT = int(os.getenv("ORCHESTRATOR_PORT", "8100"))
+ORCHESTRATOR_HOST = os.getenv("ORCHESTRATOR_HOST", "localhost")
 REGISTRY_URL = os.getenv("REGISTRY_URL", "http://localhost:8000")
 AWS_REGION = os.getenv("AWS_REGION", "eu-west-2")
 BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20241022-v2:0")
@@ -355,7 +398,9 @@ BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20
 orchestrator_id = None
 registry_client = None
 bedrock_client = None
-active_workflows: Dict[str, Dict[str, Any]] = {}
+# NOTE: active_workflows was a per-process dict and has been replaced by
+# dist_state.workflows — a shared, Redis-backed store for HA deployments.
+# All former `active_workflows[...]` usages now go through dist_state.
 
 
 async def register_with_registry():
@@ -378,10 +423,10 @@ async def register_with_registry():
             )
         ],
         has_llm=True,
-        endpoint=f"http://localhost:{ORCHESTRATOR_PORT}"
+        endpoint=f"http://{ORCHESTRATOR_HOST}:{ORCHESTRATOR_PORT}"
     )
     
-    registry_client = A2AClient(REGISTRY_URL)
+    registry_client = A2AClient(REGISTRY_URL, timeout=int(os.getenv("AGENT_TASK_TIMEOUT", "300")))
     
     try:
         response = await registry_client.register_agent(metadata)
@@ -442,15 +487,19 @@ async def lifespan(app: FastAPI):
     print("Starting Orchestrator Service...")
     
     # Initialize database and managers
-    from database import WorkflowDatabase
+    from ha_database import get_workflow_database
     from interaction import InteractionManager
     from executor import WorkflowExecutor
     
     global db, interaction_mgr, executor
-    db = WorkflowDatabase()
+    db = get_workflow_database()
     interaction_mgr = InteractionManager(db)
     executor = WorkflowExecutor(db, interaction_mgr)
     print("✓ Database and managers initialized")
+    
+    # Start distributed state (registers instance, begins heartbeat)
+    await dist_state.startup()
+    print(f"✓ Distributed state started — backend={dist_state.backend.value} instance={dist_state.instance_id}")
     
     # Initialize Bedrock
     init_bedrock()
@@ -467,6 +516,8 @@ async def lifespan(app: FastAPI):
     if registry_client and orchestrator_id:
         await registry_client.unregister_agent(orchestrator_id)
         await registry_client.close()
+    # Graceful distributed state shutdown (deregisters instance, closes connections)
+    await dist_state.shutdown()
 
 
 app = FastAPI(
@@ -516,12 +567,26 @@ def init_websocket_handler():
     
     # Pass the resume_workflow function to the handler
     ws_handler = WebSocketMessageHandler(db, interaction_mgr, executor, resume_workflow_func=resume_workflow)
-    print("✓ WebSocket handler initialized")
+
+    # HA: wrap broadcast_to_workflow so every local broadcast ALSO publishes to
+    # Redis pub/sub — other replicas subscribe and forward to their WS clients.
+    _original_broadcast = ws_handler.connection_manager.broadcast_to_workflow
+
+    async def _ha_broadcast(workflow_id: str, event: dict) -> None:
+        # Deliver to WebSocket clients connected to THIS instance
+        await _original_broadcast(workflow_id, event)
+        # Fan-out to all other orchestrator replicas via pub/sub
+        await dist_state.pubsub.publish(workflow_id, event)
+
+    ws_handler.connection_manager.broadcast_to_workflow = _ha_broadcast
+    # Store the original local-only broadcast so pub/sub subscribers can forward
+    # to local WS clients WITHOUT re-publishing to pub/sub (prevents feedback loop)
+    ws_handler.connection_manager._local_broadcast = _original_broadcast
+    print("✓ WebSocket handler initialized (HA pub/sub fan-out enabled)")
 
 
-# Global store for session history (persists across workflows)
-# Format: session_id -> list of {"task": str, "result": str, "timestamp": str}
-session_store: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+# NOTE: session_store was a per-process defaultdict. It is now backed by
+# dist_state.sessions which is Redis-backed in HA mode for cross-instance persistence.
 
 
 @app.get("/")
@@ -535,15 +600,22 @@ async def root():
 
 @app.get("/health")
 async def health():
+    active_ids = await dist_state.workflows.list_ids()
     return {
         "status": "healthy",
         "orchestrator_id": orchestrator_id,
-        "active_workflows": len(active_workflows)
+        "instance_id": dist_state.instance_id,
+        "ha_backend": dist_state.backend.value,
+        "active_workflows": len(active_ids)
     }
 
 
 @app.post("/api/workflow/execute")
-async def execute_workflow(request: Dict[str, Any]):
+async def execute_workflow(
+    request: Dict[str, Any],
+    user: UserContext = Depends(get_current_user),
+    user_headers: Dict[str, str] = Depends(get_user_headers)
+):
     """Execute a workflow using THINK-PLAN-EXECUTE-VERIFY-REFLECT pattern"""
     task_description = request.get("task_description")
     if not task_description:
@@ -564,8 +636,8 @@ async def execute_workflow(request: Dict[str, Any]):
         "completed_steps": []
     }
     
-    if workflow_id not in active_workflows:
-        active_workflows[workflow_id] = workflow_state
+    if not await dist_state.workflow_exists(workflow_id):
+        await dist_state.set_workflow_state(workflow_id, workflow_state)
         # Also save to DB for WebSocket handler
         workflow_record = WorkflowRecord(
             workflow_id=workflow_id,
@@ -580,17 +652,14 @@ async def execute_workflow(request: Dict[str, Any]):
         # Run workflow in background task
         async def run_workflow_with_error_handling():
             try:
-                # Mock headers for identity propagation (In real app, extract from request)
-                mock_headers = {"X-User-ID": "user_123", "X-User-Role": "admin"}
-                await _execute_workflow_internal(workflow_id, task_description, headers=mock_headers)
+                # Use real authenticated user context
+                await _execute_workflow_internal(workflow_id, task_description, headers=user_headers)
             except Exception as e:
                 print(f"❌ Background workflow execution failed: {e}")
                 import traceback
                 traceback.print_exc()
-                # Update workflow status
-                if workflow_id in active_workflows:
-                    active_workflows[workflow_id]["status"] = "failed"
-                    active_workflows[workflow_id]["error"] = str(e)
+                # Update workflow status in distributed store
+                await dist_state.update_workflow_state(workflow_id, {"status": "failed", "error": str(e)})
         
         asyncio.create_task(run_workflow_with_error_handling())
         return {
@@ -601,16 +670,14 @@ async def execute_workflow(request: Dict[str, Any]):
         }
     else:
         # Run workflow synchronously (original behavior)
-        # Mock headers for identity propagation
-        mock_headers = {"X-User-ID": "user_123", "X-User-Role": "admin"}
-        return await _execute_workflow_internal(workflow_id, task_description, headers=mock_headers)
+        return await _execute_workflow_internal(workflow_id, task_description, headers=user_headers)
 
 
 async def _execute_workflow_internal(workflow_id: str, task_description: str, headers: Dict[str, str] = None):
     """Internal workflow execution logic"""
     headers = headers or {}
     user_context = security_manager.get_user_context(headers)
-    user_id = user_context["user_id"]
+    user_id = user_context.user_id
     
     print(f"\n{'='*80}")
     print(f"🚀 WORKFLOW EXECUTION STARTED (User: {user_id})")
@@ -633,8 +700,8 @@ async def _execute_workflow_internal(workflow_id: str, task_description: str, he
     
     execution_log = []
     
-    # Retrieve session history
-    workflow_state = active_workflows.get(workflow_id, {})
+    # Retrieve session history from distributed store
+    workflow_state = await dist_state.get_workflow_state(workflow_id) or {}
     session_id = workflow_state.get("session_id")
     session_history = None
     if session_id:
@@ -642,6 +709,29 @@ async def _execute_workflow_internal(workflow_id: str, task_description: str, he
         session_history = db.get_session_history(session_id)
         if session_history:
             print(f"   📜 Found {len(session_history)} previous session interactions")
+
+        # Augment with semantically relevant long-term memories
+        if vector_memory.is_enabled:
+            semantic_memories = await vector_memory.recall(
+                query=task_description,
+                session_id=None,  # Search globally across sessions
+                top_k=5
+            )
+            if semantic_memories:
+                print(f"   🧠 Recalled {len(semantic_memories)} long-term memories via vector search")
+                # Prepend semantic memories to session history so the planner sees them
+                memory_items = [
+                    {
+                        "task": m.metadata.get("task", m.text[:120]),
+                        "result": m.metadata.get("result", ""),
+                        "timestamp": m.metadata.get("timestamp", ""),
+                        "workflow_id": m.metadata.get("workflow_id", ""),
+                        "_memory_score": round(m.score, 3),
+                        "_source": "vector_recall"
+                    }
+                    for m in semantic_memories
+                ]
+                session_history = memory_items + (session_history or [])
     
     try:
         # PHASE 1: THINK - Understand the task and available resources
@@ -706,7 +796,9 @@ async def _execute_workflow_internal(workflow_id: str, task_description: str, he
             "execution_log": execution_log
         }
         
-        active_workflows[workflow_id] = workflow_state
+        await dist_state.set_workflow_state(workflow_id, workflow_state)
+        # Claim ownership so other replicas know this instance is handling it
+        await dist_state.ownership.claim(workflow_id, dist_state.instance_id)
         
         # Context accumulator for cross-step data sharing
         workflow_context = {
@@ -790,7 +882,7 @@ async def _execute_workflow_internal(workflow_id: str, task_description: str, he
             )
             
             # SECURITY: Tool Authorization (Deterministic Check)
-            if not security_manager.validate_tool_authorization(user_context["role"], capability, enriched_parameters):
+            if not security_manager.validate_tool_authorization(user_context.role, capability, enriched_parameters):
                 error_msg = f"Security Policy Blocked: Authorization failed for '{capability}' with params {enriched_parameters}"
                 print(f"      ❌ {error_msg}")
                 audit_logger.log_event(workflow_id, user_id, "SECURITY_VIOLATION", {"capability": capability, "params": enriched_parameters})
@@ -1492,6 +1584,21 @@ async def resume_workflow(workflow_id: str) -> Dict[str, Any]:
                     "workflow_id": workflow_id
                 }
                 db.save_session_history(session_id, history_item)
+
+                # Store in vector memory for long-term semantic recall
+                if vector_memory.is_enabled:
+                    await vector_memory.remember(
+                        session_id=session_id,
+                        text=f"Task: {task_description}\nResult: {final_output[:500]}",
+                        metadata={
+                            "task": task_description,
+                            "result": final_output[:1000],
+                            "result_summary": final_output[:400],
+                            "workflow_id": workflow_id,
+                            "timestamp": datetime.utcnow().isoformat()
+                        }
+                    )
+                    print(f"   🧠 Stored workflow result in vector memory")
                 
                 # Get count for logging
                 hist = db.get_session_history(session_id)
@@ -1747,21 +1854,6 @@ Return ONLY the JSON object. No markdown formatting, no code blocks, no explanat
         print(f"   Generating plan with {len(session_history)} history items")
     
     try:
-        # Enable Prompt Caching for the System Prompt / Instructions
-        # We split the prompt into "System Instructions" (Cached) and "Current Task" (Dynamic)
-        
-        # 1. System Block (Cached)
-        system_content = [{
-            "text": prompt.split("USER TASK:")[0], # Everything before the dynamic user task
-            "cachePoint": {"type": "default"}
-        }]
-        
-        # 2. User Message (Dynamic)
-        user_content = [{"text": f"USER TASK:\n{task_description}\n\nAVAILABLE CAPABILITIES:\n{capabilities_str}\n\nINSTRUCTIONS: (As defined in system prompt)"}]
-        
-        # Actually, standard converse API puts system prompt in 'system' param
-        # Re-structuring to use 'system' parameter for caching
-        
         system_instruction = prompt.split("USER TASK:")[0]
         
         # Include history in the user task part if available
@@ -1771,25 +1863,12 @@ Return ONLY the JSON object. No markdown formatting, no code blocks, no explanat
             
         user_task_part += f"\nAVAILABLE CAPABILITIES:\n{capabilities_str}\n\nGenerate the JSON execution plan based on the system instructions."
 
-        try:
-            response = bedrock_client.converse(
-                modelId=BEDROCK_MODEL_ID,
-                system=[{
-                    "text": system_instruction,
-                    "cachePoint": {"type": "default"} # Cache the heavy instruction set
-                }],
-                messages=[{"role": "user", "content": [{"text": user_task_part}]}],
-                inferenceConfig={"maxTokens": 4000, "temperature": 0.1}
-            )
-        except Exception as e:
-            print(f"   ⚠️ Prompt Caching failed (likely unsupported by current SDK/Region). Retrying without cache: {e}")
-            # Fallback to standard request without cachePoint
-            response = bedrock_client.converse(
-                modelId=BEDROCK_MODEL_ID,
-                system=[{"text": system_instruction}],
-                messages=[{"role": "user", "content": [{"text": user_task_part}]}],
-                inferenceConfig={"maxTokens": 4000, "temperature": 0.1}
-            )
+        response = bedrock_client.converse(
+            modelId=BEDROCK_MODEL_ID,
+            system=[{"text": system_instruction}],
+            messages=[{"role": "user", "content": [{"text": user_task_part}]}],
+            inferenceConfig={"maxTokens": 4000, "temperature": 0.1}
+        )
         
         content = response['output']['message']['content'][0]['text']
         print(f"   ✓ LLM Response received ({len(content)} characters)")
@@ -1818,7 +1897,21 @@ Return ONLY the JSON object. No markdown formatting, no code blocks, no explanat
         
         try:
             plan = json.loads(content)
-            
+
+            # Normalise nested {"plan": {"steps": [...]}} structure that some
+            # LLM responses return instead of the expected top-level {"steps": [...]}
+            if "plan" in plan and isinstance(plan["plan"], dict):
+                inner = plan["plan"]
+                plan = {
+                    "steps": inner.get("steps", []),
+                    "reasoning": inner.get("description") or inner.get("name") or inner.get("purpose") or ""
+                }
+
+            # Normalise step fields: "action" → "capability", "id" → step_number placeholder
+            for step in plan.get("steps", []):
+                if "capability" not in step and "action" in step:
+                    step["capability"] = step.pop("action")
+
             # Validate plan structure
             if "steps" not in plan or not isinstance(plan["steps"], list) or len(plan["steps"]) == 0:
                 print(f"   ⚠️  Invalid plan structure - missing or empty steps")
@@ -2115,25 +2208,12 @@ ANALYZE:
 5. What could be improved?"""
     
     try:
-        # Enable Prompt Caching for the System Instruction
-        try:
-            response = bedrock_client.converse(
-                modelId=BEDROCK_MODEL_ID,
-                system=[{
-                    "text": system_instruction,
-                    "cachePoint": {"type": "default"}
-                }],
-                messages=[{"role": "user", "content": [{"text": user_context}]}],
-                inferenceConfig={"maxTokens": 2000, "temperature": 0.5}
-            )
-        except Exception as e:
-            print(f"   ⚠️ Prompt Caching failed. Retrying without cache: {e}")
-            response = bedrock_client.converse(
-                modelId=BEDROCK_MODEL_ID,
-                system=[{"text": system_instruction}],
-                messages=[{"role": "user", "content": [{"text": user_context}]}],
-                inferenceConfig={"maxTokens": 2000, "temperature": 0.5}
-            )
+        response = bedrock_client.converse(
+            modelId=BEDROCK_MODEL_ID,
+            system=[{"text": system_instruction}],
+            messages=[{"role": "user", "content": [{"text": user_context}]}],
+            inferenceConfig={"maxTokens": 2000, "temperature": 0.5}
+        )
         
         content = response['output']['message']['content'][0]['text']
         content = content.strip()
@@ -2166,9 +2246,10 @@ ANALYZE:
 @app.get("/api/workflow/{workflow_id}")
 async def get_workflow(workflow_id: str):
     """Get workflow status"""
-    if workflow_id not in active_workflows:
+    state = await dist_state.get_workflow_state(workflow_id)
+    if state is None:
         raise HTTPException(status_code=404, detail="Workflow not found")
-    return active_workflows[workflow_id]
+    return state
 
 
 @app.get("/api/agents")
@@ -2228,8 +2309,14 @@ async def websocket_endpoint(websocket: WebSocket, workflow_id: str):
     if not ws_handler:
         await websocket.close(code=1011, reason="WebSocket handler not initialized")
         return
-    
-    await ws_handler.handle_connection(websocket, workflow_id)
+
+    # HA: subscribe to pub/sub so this replica receives events published by
+    # whichever replica is currently executing the workflow.
+    await dist_state.subscribe_local_websocket(workflow_id, ws_handler.connection_manager)
+    try:
+        await ws_handler.handle_connection(websocket, workflow_id)
+    finally:
+        await dist_state.pubsub.unsubscribe(workflow_id)
 
 
 @app.post("/api/workflow/{workflow_id}/respond")

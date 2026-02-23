@@ -2,9 +2,7 @@
 Task Executor Agent - Standalone Service
 General-purpose worker for executing various tasks
 """
-import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
@@ -23,6 +21,7 @@ load_dotenv()
 # Configuration
 AGENT_NAME = os.getenv("AGENT_NAME", "TaskExecutor")
 AGENT_PORT = int(os.getenv("AGENT_PORT", "8004"))
+AGENT_HOST = os.getenv("AGENT_HOST", "localhost")
 REGISTRY_URL = os.getenv("REGISTRY_URL", "http://localhost:8000")
 
 agent_id = None
@@ -52,7 +51,7 @@ async def register_with_registry():
             )
         ],
         has_llm=False,
-        endpoint=f"http://localhost:{AGENT_PORT}"
+        endpoint=f"http://{AGENT_HOST}:{AGENT_PORT}"
     )
     
     registry_client = A2AClient(REGISTRY_URL)

@@ -19,7 +19,7 @@ SERVER_HOST = os.getenv("MCP_FILE_OPS_HOST", "0.0.0.0")
 SERVER_PORT = int(os.getenv("MCP_FILE_OPS_PORT", "8210"))
 MCP_REGISTRY_URL = os.getenv("MCP_REGISTRY_URL", "http://localhost:8200")
 WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/tmp/mcp_workspace")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "info")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "info").lower()
 
 
 # Models
