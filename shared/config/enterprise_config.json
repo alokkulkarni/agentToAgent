@@ -1,0 +1,220 @@
+{
+  "$schema": "./schemas/enterprise_config_schema.json",
+  "version": "2.0.0",
+  "environment": "development",
+  "deployment_id": "default",
+  
+  "feature_flags": {
+    "enable_guardrails": true,
+    "enable_audit_logging": true,
+    "enable_security_checks": true,
+    "enable_pii_redaction": true,
+    "enable_prompt_caching": false,
+    "enable_chain_of_thought_logging": true,
+    "enable_identity_propagation": true,
+    "enable_session_persistence": true,
+    "enable_web_search": true,
+    "strict_mode": false
+  },
+  
+  "compliance": {
+    "worm_storage_path": "./audit_logs",
+    "log_retention_days": 90,
+    "encryption_at_rest": true,
+    "audit_signature_algorithm": "SHA256",
+    "require_chain_verification": true,
+    "gdpr_compliance": false,
+    "hipaa_compliance": false,
+    "pci_dss_compliance": false
+  },
+  
+  "llm": {
+    "provider": "bedrock",
+    "default_model": "anthropic.claude-3-sonnet-20240229-v1:0",
+    "fallback_model": "anthropic.claude-3-haiku-20240307-v1:0",
+    "planning_model": "anthropic.claude-3-sonnet-20240229-v1:0",
+    "reflection_model": "anthropic.claude-3-haiku-20240307-v1:0",
+    "region": "us-east-1",
+    "max_tokens": 4096,
+    "temperature": 0.7,
+    "planning_temperature": 0.1,
+    "timeout_seconds": 120,
+    "retry_attempts": 3,
+    "retry_backoff_seconds": 2,
+    "enable_streaming": false
+  },
+  
+  "session": {
+    "max_history_items": 50,
+    "history_summary_threshold": 20,
+    "session_timeout_minutes": 60,
+    "persist_sessions": true,
+    "session_storage_path": "./sessions",
+    "enable_cross_workflow_context": true,
+    "max_context_tokens": 8000
+  },
+  
+  "rate_limiting": {
+    "enabled": true,
+    "requests_per_minute": 60,
+    "tokens_per_minute": 100000,
+    "burst_limit": 10,
+    "per_user_limits": true
+  },
+  
+  "logging": {
+    "level": "INFO",
+    "format": "json",
+    "output": "file",
+    "log_directory": "./logs",
+    "include_timestamps": true,
+    "include_request_ids": true,
+    "include_trace_ids": true,
+    "sensitive_fields_mask": ["password", "api_key", "token", "secret", "ssn", "credit_card"],
+    "max_log_size_mb": 100,
+    "log_rotation_count": 10
+  },
+  
+  "network": {
+    "bind_host": "0.0.0.0",
+    "public_host": "localhost",
+    "use_ssl": false,
+    "ssl_cert_path": "",
+    "ssl_key_path": "",
+    "cors_origins": ["*"],
+    "request_timeout_seconds": 300
+  },
+  
+  "services": {
+    "registry": {
+      "host": "localhost",
+      "port": 8000,
+      "protocol": "http",
+      "health_endpoint": "/api/health",
+      "heartbeat_interval_seconds": 10,
+      "heartbeat_timeout_seconds": 60
+    },
+    "orchestrator": {
+      "host": "localhost",
+      "port": 8100,
+      "protocol": "http",
+      "websocket_path": "/ws/workflow",
+      "max_concurrent_workflows": 100,
+      "workflow_timeout_seconds": 3600,
+      "step_timeout_seconds": 300
+    },
+    "mcp_registry": {
+      "host": "localhost",
+      "port": 8200,
+      "protocol": "http"
+    },
+    "mcp_gateway": {
+      "host": "localhost",
+      "port": 8300,
+      "protocol": "http",
+      "tool_timeout_seconds": 60
+    }
+  },
+  
+  "agents": {
+    "code_analyzer": {
+      "name": "CodeAnalyzer",
+      "host": "localhost",
+      "port": 8001,
+      "protocol": "http",
+      "enabled": true
+    },
+    "data_processor": {
+      "name": "DataProcessor",
+      "host": "localhost",
+      "port": 8002,
+      "protocol": "http",
+      "enabled": true
+    },
+    "research_agent": {
+      "name": "ResearchAgent",
+      "host": "localhost",
+      "port": 8003,
+      "protocol": "http",
+      "enabled": true,
+      "enable_web_search": true
+    },
+    "task_executor": {
+      "name": "TaskExecutor",
+      "host": "localhost",
+      "port": 8004,
+      "protocol": "http",
+      "enabled": true
+    },
+    "observer": {
+      "name": "Observer",
+      "host": "localhost",
+      "port": 8005,
+      "protocol": "http",
+      "enabled": true
+    },
+    "math_agent": {
+      "name": "MathAgent",
+      "host": "localhost",
+      "port": 8006,
+      "protocol": "http",
+      "enabled": true,
+      "use_mcp_tools": true
+    }
+  },
+  
+  "mcp_servers": {
+    "file_ops": {
+      "name": "FileOperations",
+      "host": "localhost",
+      "port": 8210,
+      "protocol": "http",
+      "enabled": true,
+      "workspace_path": "/tmp/mcp_workspace"
+    },
+    "database": {
+      "name": "Database",
+      "host": "localhost",
+      "port": 8211,
+      "protocol": "http",
+      "enabled": true,
+      "database_path": "/tmp/mcp_database.db"
+    },
+    "web_search": {
+      "name": "WebSearch",
+      "host": "localhost",
+      "port": 8212,
+      "protocol": "http",
+      "enabled": true,
+      "search_provider": "duckduckgo",
+      "max_results": 10
+    },
+    "calculator": {
+      "name": "Calculator",
+      "host": "localhost",
+      "port": 8213,
+      "protocol": "http",
+      "enabled": true
+    }
+  },
+  
+  "workflow": {
+    "enable_persistence": true,
+    "database_path": "./workflows.db",
+    "enable_retry": true,
+    "max_retries": 3,
+    "retry_delay_seconds": 1.0,
+    "max_retry_delay_seconds": 30.0,
+    "enable_parallel_execution": true,
+    "max_parallel_steps": 5,
+    "default_timeout_seconds": 3600
+  },
+  
+  "health_check": {
+    "enabled": true,
+    "interval_seconds": 10,
+    "timeout_seconds": 5,
+    "max_retries": 3,
+    "unhealthy_threshold": 3
+  }
+}

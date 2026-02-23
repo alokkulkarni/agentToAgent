@@ -20,14 +20,25 @@ from shared.a2a_protocol import (
 )
 from shared.agent_interaction import AgentInteractionHelper
 from shared.audit import AuditLogger
+from shared.config import ConfigManager
 
 load_dotenv()
 
-# Configuration
-AGENT_NAME = os.getenv("AGENT_NAME", "MathAgent")
-AGENT_PORT = int(os.getenv("AGENT_PORT", "8006"))
-REGISTRY_URL = os.getenv("REGISTRY_URL", "http://localhost:8000")
-MCP_GATEWAY_URL = os.getenv("MCP_GATEWAY_URL", "http://localhost:9000")
+# Get configuration from centralized config manager
+config = ConfigManager.get_instance()
+
+# Configuration with fallbacks to environment variables
+AGENT_KEY = "math_agent"
+agent_config = config.get_agent_config(AGENT_KEY)
+
+AGENT_NAME = os.getenv("AGENT_NAME", agent_config.get("name", "MathAgent"))
+AGENT_PORT = int(os.getenv("AGENT_PORT", agent_config.get("port", 8006)))
+AGENT_HOST = os.getenv("AGENT_HOST", config.network.bind_host)
+PUBLIC_HOST = os.getenv("PUBLIC_HOST", config.network.public_host)
+
+# Service URLs from config
+REGISTRY_URL = os.getenv("REGISTRY_URL", config.get_service_url("registry"))
+MCP_GATEWAY_URL = os.getenv("MCP_GATEWAY_URL", config.get_service_url("mcp_gateway"))
 
 agent_id = None
 agent_metadata = None
@@ -38,6 +49,9 @@ audit_logger = AuditLogger()
 async def register_with_registry():
     """Register this agent with the registry"""
     global agent_id, agent_metadata, registry_client
+    
+    # Use public host for endpoint registration
+    endpoint_url = f"http://{PUBLIC_HOST}:{AGENT_PORT}"
     
     agent_metadata = AgentMetadata(
         name=AGENT_NAME,
@@ -65,7 +79,7 @@ async def register_with_registry():
             )
         ],
         has_llm=False,
-        endpoint=f"http://localhost:{AGENT_PORT}"
+        endpoint=endpoint_url
     )
     
     registry_client = A2AClient(REGISTRY_URL)
@@ -74,6 +88,9 @@ async def register_with_registry():
         response = await registry_client.register_agent(agent_metadata)
         agent_id = response.agent_id
         print(f"✓ Registered with registry: {agent_id}")
+        print(f"  Endpoint: {endpoint_url}")
+        print(f"  Registry: {REGISTRY_URL}")
+        print(f"  MCP Gateway: {MCP_GATEWAY_URL}")
         asyncio.create_task(send_heartbeats())
     except Exception as e:
         print(f"✗ Failed to register: {e}")
@@ -364,4 +381,4 @@ async def handle_statistics(params: Dict[str, Any]) -> Dict[str, Any]:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=AGENT_PORT)
+    uvicorn.run(app, host=AGENT_HOST, port=AGENT_PORT)

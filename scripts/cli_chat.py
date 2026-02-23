@@ -51,9 +51,15 @@ except ImportError:
     from rich.table import Table
     from rich import box
 
-# Configuration
-ORCHESTRATOR_URL = "http://127.0.0.1:8100"
-WS_URL = "ws://127.0.0.1:8100"
+# Configuration - All values can be overridden via environment variables
+import os
+ORCHESTRATOR_HOST = os.getenv("ORCHESTRATOR_HOST", "127.0.0.1")
+ORCHESTRATOR_PORT = os.getenv("ORCHESTRATOR_PORT", "8100")
+ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", f"http://{ORCHESTRATOR_HOST}:{ORCHESTRATOR_PORT}")
+WS_URL = os.getenv("ORCHESTRATOR_WS_URL", f"ws://{ORCHESTRATOR_HOST}:{ORCHESTRATOR_PORT}")
+SESSION_FILE = os.getenv("CLI_SESSION_FILE", ".agent_session")
+CONNECTION_TIMEOUT = int(os.getenv("CLI_CONNECTION_TIMEOUT", "30"))
+RESPONSE_TIMEOUT = int(os.getenv("CLI_RESPONSE_TIMEOUT", "10"))
 
 console = Console()
 
@@ -64,7 +70,7 @@ class OrchestratorClient:
         self.websocket = None
         
         # Load or create persistent session ID
-        self.session_file = ".agent_session"
+        self.session_file = SESSION_FILE
         try:
             with open(self.session_file, "r") as f:
                 self.session_id = f.read().strip()

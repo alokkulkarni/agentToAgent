@@ -106,7 +106,10 @@ All actions are logged to `logs/audit_chain.json`.
 ## 📚 Documentation
 
 *   **[ARCHITECTURE.md](ARCHITECTURE.md)**: Detailed system design, security flow, and component interaction.
-*   **[DEPLOYMENT.md](DEPLOYMENT.md)**: Guide for deploying to Docker/Kubernetes.
+*   **[DEPLOYMENT_SUMMARY.md](DEPLOYMENT_SUMMARY.md)**: Central hub for all deployment guides.
+*   **[AWS Deployment](DEPLOYMENT_AWS.md)**: Deployment on ECS Fargate, EKS, and EC2.
+*   **[Azure Deployment](DEPLOYMENT_AZURE.md)**: Deployment on ACA, AKS, and VMs.
+*   **[General Deployment](DEPLOYMENT.md)**: Local Docker Compose setup.
 *   **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)**: Common issues and fixes.
 
 ---
