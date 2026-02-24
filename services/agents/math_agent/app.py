@@ -158,7 +158,16 @@ async def call_mcp_gateway(server_name: str, tool_name: str, arguments: Dict[str
                 }
             )
             response.raise_for_status()
-            return response.json()
+            data = response.json()
+            # Detect embedded errors returned inside an HTTP 200 response
+            # (e.g. {"result": {"error": "All connection attempts failed"}})
+            inner_result = data.get("result")
+            if isinstance(inner_result, dict) and "error" in inner_result:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"MCP tool '{tool_name}' failed: {inner_result['error']}"
+                )
+            return data
         except httpx.HTTPError as e:
             raise HTTPException(status_code=500, detail=f"MCP Gateway error: {str(e)}")
 
@@ -336,7 +345,23 @@ async def handle_advanced_math(params: Dict[str, Any]) -> Dict[str, Any]:
     
     if not operation or value is None:
         raise ValueError("operation and value are required")
-    
+
+    # Reject non-numeric values early — if a prior step failed and injected an error
+    # dict as the value, surface a clear message instead of a cryptic float() TypeError.
+    if isinstance(value, dict):
+        error_msg = value.get("error") or str(value)
+        raise ValueError(
+            f"Invalid value for advanced_math '{operation}': received an error from a previous step: {error_msg}"
+        )
+
+    # Reject unresolved step-reference placeholders (e.g. "<result_from_step_1>"),
+    # which means the dependency step failed or its result was never stored.
+    if isinstance(value, str) and "<" in value and ">" in value:
+        raise ValueError(
+            f"Invalid value for advanced_math '{operation}': unresolved step reference '{value}'. "
+            f"The previous step that should provide this value likely failed."
+        )
+
     # Map operations to MCP calculator tools and prepare arguments
     if operation == "square":
         tool_name = "square"

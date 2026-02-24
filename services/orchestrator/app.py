@@ -138,18 +138,30 @@ async def enrich_with_workflow_context(
                     def extract_scalar_recursive(data):
                         if not isinstance(data, dict):
                             return data
+                        # If this dict is itself an error payload, return None so callers
+                        # know not to inject this value into downstream parameters.
+                        if "error" in data and len(data) == 1:
+                            return None
                         for key in ["result", "answer", "output", "value", "content"]:
                             if key in data:
                                 val = data[key]
                                 if isinstance(val, dict):
-                                    return extract_scalar_recursive(val)
+                                    inner = extract_scalar_recursive(val)
+                                    # Propagate None (error) upward
+                                    return inner
                                 return val
                         return data
 
                     # If result is a dict with common output keys, extract the value
                     if isinstance(result, dict):
-                         enriched[key] = extract_scalar_recursive(result)
-                         print(f"         ✓ Injected extracted value from step {step_num}")
+                        extracted = extract_scalar_recursive(result)
+                        if extracted is None:
+                            # Step result is an error — skip injection so downstream steps
+                            # keep the placeholder and fail with a clear message.
+                            print(f"         ⚠️  Step {step_num} result is an error — skipping injection")
+                        else:
+                            enriched[key] = extracted
+                            print(f"         ✓ Injected extracted value from step {step_num}")
                     else:
                         enriched[key] = result
                         print(f"         ✓ Injected result from step {step_num}")
@@ -1012,6 +1024,37 @@ async def _execute_workflow_internal(workflow_id: str, task_description: str, he
                 
                 # PHASE 4: VERIFY - Verify step execution
                 elif response.status == TaskStatus.COMPLETED:
+                    # Guard: some agents return HTTP 200 / COMPLETED but embed an MCP
+                    # failure inside the result payload, e.g.:
+                    #   {"result": {"error": "All connection attempts failed"}, ...}
+                    # Detect this and treat the step as genuinely failed so the error is
+                    # surfaced cleanly instead of propagating a corrupt value downstream.
+                    _r = response.result if isinstance(response.result, dict) else {}
+                    _inner_r = _r.get("result", _r)
+                    _embedded_err = _inner_r.get("error") if isinstance(_inner_r, dict) else None
+                    if _embedded_err:
+                        _err_msg = f"MCP tool error: {_embedded_err}"
+                        print(f"      ❌ Step {step_num} VERIFICATION FAILED: {_err_msg}")
+                        execution_log.append({
+                            "phase": "EXECUTE-VERIFY",
+                            "step_number": step_num,
+                            "status": "failed",
+                            "error": _err_msg
+                        })
+                        if ws_handler and ws_handler.connection_manager.has_connections(workflow_id):
+                            await ws_handler.connection_manager.broadcast_to_workflow(workflow_id, {
+                                "type": "step_failed",
+                                "workflow_id": workflow_id,
+                                "step": {
+                                    "step_number": step_num,
+                                    "capability": capability,
+                                    "description": description
+                                },
+                                "error": _err_msg,
+                                "timestamp": datetime.utcnow().isoformat()
+                            })
+                        continue  # Do NOT add to completed_steps / step_results
+
                     workflow_state["completed_steps"].append(step_num)
                     
                     result_data = {
