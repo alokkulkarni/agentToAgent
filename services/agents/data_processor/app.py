@@ -48,17 +48,36 @@ async def register_with_registry():
         capabilities=[
             AgentCapability(
                 name="transform_data",
-                description="Transform data between formats"
+                description="Transform or reformat data (e.g. JSON to CSV, filter fields, reshape records).",
+                input_schema={
+                    "parameters": {
+                        "data": {"type": "string", "required": True, "description": "Input data to transform"},
+                        "target_format": {"type": "string", "required": False, "description": "Desired output format (e.g. 'csv', 'json', 'flat')"}
+                    },
+                    "example": {"data": "[{\"name\": \"Alice\", \"age\": 30}]", "target_format": "csv"}
+                }
             ),
             AgentCapability(
                 name="analyze_data",
-                description="Analyze data and extract insights using LLM",
-                requires_llm=True
+                description="Analyze structured or unstructured data and extract key insights using LLM.",
+                requires_llm=True,
+                input_schema={
+                    "parameters": {
+                        "data": {"type": "string", "required": True, "description": "Data to analyze (text, JSON, CSV, etc.)"}
+                    },
+                    "example": {"data": "Sales Q1: 100, Q2: 150, Q3: 120, Q4: 200"}
+                }
             ),
             AgentCapability(
                 name="summarize_data",
-                description="Summarize large datasets using LLM",
-                requires_llm=True
+                description="Produce a concise summary of a large dataset or document using LLM.",
+                requires_llm=True,
+                input_schema={
+                    "parameters": {
+                        "data": {"type": "string", "required": True, "description": "Large text or dataset to summarize"}
+                    },
+                    "example": {"data": "<large text or dataset>"}
+                }
             )
         ],
         has_llm=True,

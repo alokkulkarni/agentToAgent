@@ -57,23 +57,53 @@ async def register_with_registry():
         capabilities=[
             AgentCapability(
                 name="calculate",
-                description="Perform mathematical calculations (add, subtract, multiply, divide)",
-                requires_llm=False
+                description="Perform basic arithmetic (add, subtract, multiply, divide) on two numbers. USE THIS for any task involving +, -, *, / with explicit numbers. Do NOT use answer_question for arithmetic.",
+                requires_llm=False,
+                input_schema={
+                    "parameters": {
+                        "operation": {"type": "string", "required": True, "enum": ["add", "subtract", "multiply", "divide"], "description": "The arithmetic operation"},
+                        "a": {"type": "number", "required": True, "description": "First operand"},
+                        "b": {"type": "number", "required": True, "description": "Second operand"}
+                    },
+                    "example": {"operation": "add", "a": 85, "b": 85},
+                    "step_reference": "Results from earlier steps can be referenced as '<result_from_step_N>'"
+                }
             ),
             AgentCapability(
                 name="advanced_math",
-                description="Perform advanced mathematical operations (power, sqrt, trigonometry)",
-                requires_llm=False
+                description="Perform advanced math: power/exponent, square root, trigonometry. USE THIS for squaring, cubing, sqrt. Value can reference a previous step result.",
+                requires_llm=False,
+                input_schema={
+                    "parameters": {
+                        "operation": {"type": "string", "required": True, "enum": ["power", "sqrt", "square", "sin", "cos", "tan"], "description": "The operation to perform"},
+                        "value": {"type": "number_or_step_ref", "required": True, "description": "The number to operate on, or <result_from_step_N> for chained steps"},
+                        "exponent": {"type": "number", "required": False, "description": "Required when operation is 'power'. E.g. 2 for square, 3 for cube"}
+                    },
+                    "example": {"operation": "power", "value": "<result_from_step_1>", "exponent": 2}
+                }
             ),
             AgentCapability(
                 name="solve_equation",
-                description="Solve mathematical equations",
-                requires_llm=False
+                description="Solve a mathematical equation expressed as a string (e.g. 'x^2 + 3x - 4 = 0').",
+                requires_llm=False,
+                input_schema={
+                    "parameters": {
+                        "equation": {"type": "string", "required": True, "description": "The equation to solve as a string"}
+                    },
+                    "example": {"equation": "x^2 - 4 = 0"}
+                }
             ),
             AgentCapability(
                 name="statistics",
-                description="Calculate statistical measures (mean, median, std dev)",
-                requires_llm=False
+                description="Calculate statistical measures (mean, median, standard deviation, sum) over a list of numbers.",
+                requires_llm=False,
+                input_schema={
+                    "parameters": {
+                        "operation": {"type": "string", "required": True, "enum": ["mean", "median", "std_dev", "sum"], "description": "Statistical measure to compute"},
+                        "numbers": {"type": "list[number]", "required": True, "description": "List of numbers to compute over"}
+                    },
+                    "example": {"operation": "mean", "numbers": [10, 20, 30, 40]}
+                }
             )
         ],
         has_llm=False,
@@ -220,23 +250,38 @@ async def handle_calculate(params: Dict[str, Any]) -> Dict[str, Any]:
     a = params.get("a")
     b = params.get("b")
     
-    # Check for user response if we asked for missing input previously
+    # Check for user response if we asked for missing input previously.
+    # user_responses now contains the FULL ordered history of Q&A for this step
+    # (oldest first). Scan all of them to resolve 'a', 'b', and 'operation'.
     if helper.has_user_response():
-        user_response = helper.get_user_response()
-        # Try to parse the missing value from user response
-        # This is a simple implementation - in production use LLM or robust parsing
-        try:
-            # If we were missing 'b', try to parse 'b'
-            if b is None and a is not None and user_response:
-                b = float(user_response)
-            # If we were missing 'a', try to parse 'a'
-            elif a is None and user_response:
-                a = float(user_response)
-            # If we were missing 'operation', use response
-            elif not operation and user_response:
-                operation = user_response.lower()
-        except ValueError:
-            pass # Could not parse, will ask again or fail
+        for resp in helper.user_responses:
+            q = (resp.get("question") or "").lower()
+            v = resp.get("content") or resp.get("value")
+            if v is None:
+                continue
+            try:
+                # Map the answer to the param based on the question text
+                if "first number" in q or "(a)" in q or "parameter 'a'" in q or "number (a)" in q:
+                    if a is None:
+                        a = float(v)
+                elif ("second number" in q or "(b)" in q or "parameter 'b'" in q
+                      or "number (b)" in q or "to add with" in q or "to subtract" in q
+                      or "to multiply" in q or "to divide" in q):
+                    if b is None:
+                        b = float(v)
+                elif "operation" in q or "which operation" in q or "what operation" in q:
+                    if not operation:
+                        operation = v.lower()
+                else:
+                    # Fallback heuristic: fill missing params in order
+                    if a is None:
+                        a = float(v)
+                    elif b is None:
+                        b = float(v)
+                    elif not operation:
+                        operation = v.lower()
+            except (ValueError, TypeError):
+                pass  # Non-numeric answer — will ask again below
             
     # INTERACTIVE: Ask for missing parameters
     if a is None:

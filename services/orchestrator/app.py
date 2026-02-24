@@ -573,10 +573,16 @@ def init_websocket_handler():
     _original_broadcast = ws_handler.connection_manager.broadcast_to_workflow
 
     async def _ha_broadcast(workflow_id: str, event: dict) -> None:
-        # Deliver to WebSocket clients connected to THIS instance
+        # Deliver to WebSocket clients connected to THIS instance directly.
         await _original_broadcast(workflow_id, event)
-        # Fan-out to all other orchestrator replicas via pub/sub
-        await dist_state.pubsub.publish(workflow_id, event)
+        # Fan-out to OTHER replicas via pub/sub backend.
+        # In single-instance (InMemory) mode we must NOT also publish here because
+        # subscribe_local_websocket() registered each WS client as a pub/sub
+        # subscriber that calls _local_broadcast — publishing would re-deliver
+        # every event a second time to the same connections.
+        from shared.distributed_state import InMemoryPubSubBroker
+        if not isinstance(dist_state.pubsub, InMemoryPubSubBroker):
+            await dist_state.pubsub.publish(workflow_id, event)
 
     ws_handler.connection_manager.broadcast_to_workflow = _ha_broadcast
     # Store the original local-only broadcast so pub/sub subscribers can forward
@@ -743,12 +749,15 @@ async def _execute_workflow_internal(workflow_id: str, task_description: str, he
         
         capabilities = {}
         capability_descriptions = {}
+        capability_schemas: Dict[str, Any] = {}   # input_schema per capability
         for agent in agents:
             print(f"   - {agent.name} ({agent.role.value})")
             for cap in agent.capabilities:
                 if cap.name not in capabilities:
                     capabilities[cap.name] = []
                     capability_descriptions[cap.name] = cap.description
+                    if cap.input_schema:
+                        capability_schemas[cap.name] = cap.input_schema
                 capabilities[cap.name].append({
                     "agent_id": agent.agent_id,
                     "agent_name": agent.name,
@@ -767,7 +776,10 @@ async def _execute_workflow_internal(workflow_id: str, task_description: str, he
         print(f"\n📋 PHASE 2: PLAN - Generating dynamic execution plan...")
         print(f"   Model: {BEDROCK_MODEL_ID}")
         
-        plan = await generate_dynamic_plan(task_description, capabilities, capability_descriptions, session_history)
+        plan = await generate_dynamic_plan(
+            task_description, capabilities, capability_descriptions,
+            session_history, capability_schemas
+        )
         
         print(f"   Generated plan with {len(plan.get('steps', []))} steps")
         print(f"   Reasoning: {plan.get('reasoning', 'N/A')[:200]}...")
@@ -1298,16 +1310,33 @@ async def resume_workflow(workflow_id: str) -> Dict[str, Any]:
         print(f"      Enriched Parameters: {json.dumps(enriched_parameters, indent=10)}")
         
         # Create task with user response in context
-        # Build user_responses list for agent's InteractionHelper
+        # Build user_responses list for agent's InteractionHelper.
+        # Include ALL previous answered Q&A turns for this step so multi-turn
+        # agents (e.g. asking for 'a', then 'b') can see the full history.
+        previous_turns = interaction_mgr.get_all_answered_for_step(
+            workflow_id, f"step_{pause_step}"
+        )
         user_responses_list = [
             {
+                "content": r.response,
+                "value": r.response,
+                "request_id": r.request_id,
+                "question": r.question,
+                "step": pause_step
+            }
+            for r in previous_turns
+        ]
+        # The current interaction may already be in previous_turns if it was
+        # marked 'completed' by complete_interaction() above; add it only if not.
+        current_ids = {r.request_id for r in previous_turns}
+        if interaction_request.request_id not in current_ids:
+            user_responses_list.append({
                 "content": interaction_request.response,
                 "value": interaction_request.response,
                 "request_id": interaction_request.request_id,
                 "question": interaction_request.question,
                 "step": pause_step
-            }
-        ]
+            })
         
         task = TaskRequest(
             capability=capability,
@@ -1736,137 +1765,110 @@ async def generate_dynamic_plan(
     task_description: str,
     capabilities: Dict[str, List[Dict]],
     capability_descriptions: Dict[str, str],
-    session_history: List[Dict] = None
+    session_history: List[Dict] = None,
+    capability_schemas: Dict[str, Any] = None,
 ) -> Dict[str, Any]:
     """
-    Generate dynamic execution plan using LLM with full capability context.
-    Uses THINK-PLAN pattern to create optimal workflow.
+    Generate a dynamic execution plan using the LLM.
+    All routing decisions are driven by the live registry data (capability
+    descriptions + input_schema) — no hardcoded routing logic here.
     """
-    
+    capability_schemas = capability_schemas or {}
     capabilities_list = list(capabilities.keys())
-    
-    # Format session history if available
+
+    # ── Session history ─────────────────────────────────────────────────
     history_str = ""
     if session_history:
-        history_str = "\nPREVIOUS CONVERSATION HISTORY (Use this context if relevant):\n"
-        for i, entry in enumerate(session_history[-5:]):  # Limit to last 5 turns
-            history_str += f"Turn {i+1} User Task: {entry['task']}\n"
-            # Summarize result if too long
+        history_str = "\nPREVIOUS CONVERSATION HISTORY (use as context if relevant):\n"
+        for i, entry in enumerate(session_history[-5:]):
+            history_str += f"Turn {i+1} Task: {entry['task']}\n"
             result_preview = str(entry['result'])
             if len(result_preview) > 800:
-                result_preview = result_preview[:800] + "... (truncated)"
+                result_preview = result_preview[:800] + "...(truncated)"
             history_str += f"Turn {i+1} Result: {result_preview}\n\n"
-    
-    # Build detailed capability descriptions with context
-    capabilities_details = []
-    for cap_name, agents in capabilities.items():
-        agent_info = agents[0]  # First agent providing this capability
-        description = capability_descriptions.get(cap_name, "No description")
-        capabilities_details.append(
-            f"- {cap_name}: {description} (Agent: {agent_info['agent_name']})"
-        )
-    
-    capabilities_str = "\n".join(capabilities_details)
-    
-    prompt = f"""You are an intelligent task orchestrator. Analyze the user's task and create a detailed step-by-step execution plan.
 
-USER TASK:
-{task_description}
+    # ── Build capability documentation dynamically from registry data ────
+    # Each capability self-describes its parameters and usage via input_schema
+    # registered by the agent at startup — nothing is hardcoded here.
+    def _build_cap_doc(cap_name: str) -> str:
+        agents_for_cap = capabilities.get(cap_name, [])
+        agent_name = agents_for_cap[0]["agent_name"] if agents_for_cap else "Unknown"
+        description = capability_descriptions.get(cap_name, "")
+        schema = capability_schemas.get(cap_name, {})
+        lines = [f"- {cap_name} (handled by: {agent_name})"]
+        lines.append(f"  Description: {description}")
+        params = schema.get("parameters", {})
+        if params:
+            param_parts = []
+            for pname, pmeta in params.items():
+                req = "REQUIRED" if pmeta.get("required") else "optional"
+                ptype = pmeta.get("type", "any")
+                pdesc = pmeta.get("description", "")
+                enum_vals = pmeta.get("enum")
+                enum_str = f" — one of {enum_vals}" if enum_vals else ""
+                param_parts.append(f"    {pname} ({req}, {ptype}{enum_str}): {pdesc}")
+            lines.append("  Parameters:")
+            lines.extend(param_parts)
+        example = schema.get("example")
+        if example:
+            lines.append(f"  Usage example: {json.dumps(example)}")
+        step_ref = schema.get("step_reference")
+        if step_ref:
+            lines.append(f"  Note: {step_ref}")
+        return "\n".join(lines)
 
-{history_str}
+    capability_docs = "\n\n".join(_build_cap_doc(c) for c in capabilities_list)
 
-AVAILABLE CAPABILITIES:
-{capabilities_str}
+    # ── Assemble planning prompt ─────────────────────────────────────────
+    system_instruction = """\
+You are an intelligent task orchestrator. Your job is to produce an optimal step-by-step \
+execution plan for the user's task using ONLY the capabilities listed below.
 
-INSTRUCTIONS:
-1. Break down the task into specific, atomic steps
-2. Each step should use ONE capability from the available list
-3. Steps should build on each other logically
-4. If the task mentions "then" or "and", treat those as separate steps
-5. For comparison tasks, first research each concept separately, THEN compare them
-6. For report generation, gather all required data first, THEN generate the report
-7. If the user refers to previous context (e.g., "rewrite the whitepaper", "how does this change X"), explicitly fetch that context using 'answer_question' or pass the relevant context in parameters.
+RULES:
+1. Use ONLY capabilities from the list. Never invent capability names.
+2. Choose the capability whose description BEST matches what that step needs to accomplish. \
+   Read each capability description carefully — they explicitly state what they should and \
+   should not be used for.
+3. Each step uses exactly ONE capability. Steps should chain logically.
+4. Decompose compound tasks (joined by "then", "and then", "after") into separate steps.
+5. When a step's input depends on an earlier step's output, reference it as \
+   <result_from_step_N> in the parameter value (e.g. <result_from_step_1>).
+6. For comparison workflows: research each concept first (separate steps), then compare.
+7. For report workflows: gather all data first, then generate the report.
+8. Set parameters to empty string / empty list when the orchestrator will inject prior \
+   step results (this is noted in each capability's description).
+9. Return ONLY valid JSON — no markdown, no code fences, no extra text.
 
-EXAMPLES:
-
-Example 1 - Math: "Calculate the sum of 25 and 17, then square the result"
-Step 1: Use "calculate" with {{"operation": "add", "a": 25, "b": 17}}
-Step 2: Use "advanced_math" with {{"operation": "power", "value": "<result_from_step_1>", "exponent": 2}}
-
-Example 2 - Research: "Research X, then research Y, and create a comparison report"
-Step 1: Use "answer_question" to research X
-Step 2: Use "answer_question" to research Y  
-Step 3: Use "compare_concepts" to compare X and Y (leave concept_a and concept_b empty - orchestrator will inject research results)
-Step 4: Use "generate_report" to create final report (leave data empty - orchestrator will inject comparison results)
-
-CAPABILITY USAGE:
-- calculate: For basic math operations (add, subtract, multiply, divide)
-  Required parameters: {{"operation": "add|subtract|multiply|divide", "a": number, "b": number}}
-  Example: {{"operation": "add", "a": 25, "b": 17}}
-  
-- advanced_math: For advanced operations (power, sqrt, sin, cos, etc)
-  Required parameters: {{"operation": "power|sqrt|sin|cos|tan", "value": number, "exponent": number (for power)}}
-  Example for squaring: {{"operation": "power", "value": 42, "exponent": 2}}
-  
-- solve_equation: For solving equations
-  Parameters: {{"equation": "equation string"}}
-  
-- statistics: For statistical calculations
-  Parameters: {{"operation": "mean|median|std_dev", "values": [numbers]}}
-
-- answer_question: For research, questions, information gathering
-  Required parameters: {{"question": "specific question to answer"}}
-  
-- compare_concepts: For comparing two things
-  Parameters: {{"concept_a": "", "concept_b": ""}} (leave empty if previous steps provide data)
-  
-- generate_report: For creating formatted reports
-  Parameters: {{"topic": "report subject", "data": ""}} (data can be empty if previous steps provide it)
-
-- analyze_data: For data analysis
-  Parameters: {{"data": "data to analyze"}}
-
-- analyze_python_code: For code analysis
-  Parameters: {{"code": "python code"}}
-
-RESPONSE FORMAT (return ONLY this JSON, no other text):
-{{
+RESPONSE FORMAT:
+{
   "steps": [
-    {{
+    {
       "step_number": 1,
       "capability": "capability_name",
       "description": "Clear description of what this step does",
-      "parameters": {{"key": "value"}},
+      "parameters": {"key": "value"},
       "expected_output": "What this step produces",
       "depends_on": []
-    }}
+    }
   ],
-  "reasoning": "Explain why you chose this plan structure"
-}}
+  "reasoning": "Brief explanation of why this plan structure was chosen"
+}"""
 
-Return ONLY the JSON object. No markdown formatting, no code blocks, no explanations outside the JSON.
-"""
-    
+    user_message = f"USER TASK:\n{task_description}\n"
+    if history_str:
+        user_message += history_str
+    user_message += f"\nAVAILABLE CAPABILITIES (registered by live agents):\n\n{capability_docs}\n\nGenerate the execution plan JSON."
+
     print(f"   Calling Bedrock with model: {BEDROCK_MODEL_ID}")
     print(f"   Temperature: 0.1 (low for structured output)")
-    
     if session_history:
         print(f"   Generating plan with {len(session_history)} history items")
-    
-    try:
-        system_instruction = prompt.split("USER TASK:")[0]
-        
-        # Include history in the user task part if available
-        user_task_part = f"USER TASK:\n{task_description}\n"
-        if history_str:
-            user_task_part += f"\n{history_str}\n"
-            
-        user_task_part += f"\nAVAILABLE CAPABILITIES:\n{capabilities_str}\n\nGenerate the JSON execution plan based on the system instructions."
 
+    try:
         response = bedrock_client.converse(
             modelId=BEDROCK_MODEL_ID,
             system=[{"text": system_instruction}],
-            messages=[{"role": "user", "content": [{"text": user_task_part}]}],
+            messages=[{"role": "user", "content": [{"text": user_message}]}],
             inferenceConfig={"maxTokens": 4000, "temperature": 0.1}
         )
         
@@ -1960,193 +1962,45 @@ Return ONLY the JSON object. No markdown formatting, no code blocks, no explanat
 
 
 def create_intelligent_default_plan(task_description: str, capabilities: List[str]) -> Dict[str, Any]:
-    """Create an intelligent default plan by parsing the task description"""
-    print(f"   Creating intelligent default plan by analyzing task")
-    
-    task_lower = task_description.lower()
-    steps = []
-    step_num = 1
-    
-    # Parse task for keywords and structure
-    # Look for sequential indicators: "then", "and then", "after", "finally"
-    parts = []
-    
-    # Split by common separators
-    for separator in [', then ', ' then ', ', and then ', ' and then ', ', finally ', ' finally ', ', after that ', ' after that ']:
-        if separator in task_lower:
-            parts = task_description.split(separator, 1)
-            if len(parts) == 2:
-                # Recursively split the second part
-                remaining = parts[1]
-                parts = [parts[0]]
-                for sep2 in [', then ', ' then ', ', and then ', ' and then ', ', finally ', ' finally ']:
-                    if sep2 in remaining.lower():
-                        sub_parts = remaining.split(sep2, 1)
-                        parts.extend(sub_parts)
-                        break
-                else:
-                    parts.append(remaining)
-                break
-    
-    # If no explicit separators, look for specific patterns
-    if not parts or len(parts) == 1:
-        # Check for comparison pattern: "Research X and Y and compare"
-        if ("compare" in task_lower or "comparison" in task_lower) and ("research" in task_lower or "analyze" in task_lower):
-            # Extract topics to research
-            if "microservices" in task_lower and "monolithic" in task_lower:
-                parts = [
-                    "Research the benefits of microservices architecture",
-                    "Research monolithic architecture",
-                    "Compare microservices and monolithic architectures",
-                    "Create a detailed comparison report"
-                ]
-            elif " and " in task_description:
-                # Generic pattern: "Research A and B and compare"
-                segments = task_description.split(" and ")
-                if len(segments) >= 2:
-                    for i, seg in enumerate(segments[:-1]):
-                        if i == 0:
-                            parts.append(seg)
-                        else:
-                            parts.append(f"Research {seg}")
-                    if "compare" in segments[-1].lower():
-                        parts.append("Compare the researched concepts")
-                    if "report" in segments[-1].lower():
-                        parts.append("Create a detailed comparison report")
-    
-    # If still no parts, treat as single task
-    if not parts:
-        parts = [task_description]
-    
-    print(f"   Identified {len(parts)} task components:")
-    for i, part in enumerate(parts, 1):
-        print(f"      {i}. {part.strip()}")
-    
-    # Map each part to capabilities
-    for part in parts:
-        part_lower = part.lower().strip()
-        
-        if not part_lower:
-            continue
-        
-        # Determine which capability to use
-        if "compare" in part_lower or "comparison" in part_lower:
-            if "compare_concepts" in capabilities:
-                steps.append({
-                    "step_number": step_num,
-                    "capability": "compare_concepts",
-                    "description": f"Compare concepts based on previous research",
-                    "parameters": {"concept_a": "", "concept_b": ""},  # Will be injected from context
-                    "expected_output": "Comparison of concepts",
-                    "depends_on": list(range(1, step_num)) if step_num > 1 else []
-                })
-                step_num += 1
-        
-        elif "report" in part_lower:
-            if "generate_report" in capabilities:
-                # Extract topic if possible
-                topic = part_lower.replace("create", "").replace("generate", "").replace("report", "").replace("detailed", "").strip()
-                if not topic:
-                    topic = "Summary report based on analysis"
-                    
-                steps.append({
-                    "step_number": step_num,
-                    "capability": "generate_report",
-                    "description": f"Generate comprehensive report",
-                    "parameters": {"topic": topic, "data": ""},  # Data will be injected
-                    "expected_output": "Formatted report",
-                    "depends_on": list(range(1, step_num)) if step_num > 1 else []
-                })
-                step_num += 1
-        
-        elif ("research" in part_lower or "question" in part_lower or "benefits" in part_lower or 
-              "explain" in part_lower or "what" in part_lower or "how" in part_lower):
-            if "answer_question" in capabilities:
-                # Use the original phrasing as the question
-                question = part.strip()
-                if not question.endswith("?"):
-                    question = question + "?"
-                    
-                steps.append({
-                    "step_number": step_num,
-                    "capability": "answer_question",
-                    "description": f"Research and answer: {question[:50]}...",
-                    "parameters": {"question": question},
-                    "expected_output": "Research findings",
-                    "depends_on": []
-                })
-                step_num += 1
-        
-        elif "code" in part_lower or "python" in part_lower:
-            # Check if it's actually asking to rewrite text about code/python
-            if "rewrite" in part_lower or "write" in part_lower or "explain" in part_lower:
-                if "answer_question" in capabilities:
-                     steps.append({
-                        "step_number": step_num,
-                        "capability": "answer_question",
-                        "description": f"Research and answer: {part.strip()}",
-                        "parameters": {"question": part.strip()},
-                        "expected_output": "Answer",
-                        "depends_on": []
-                    })
-                     step_num += 1
-                     continue # Skip other checks for this part
-            
-            if "analyze_python_code" in capabilities:
-                steps.append({
-                    "step_number": step_num,
-                    "capability": "analyze_python_code",
-                    "description": "Analyze the Python code",
-                    "parameters": {"code": "# Code to be provided"},
-                    "expected_output": "Code analysis",
-                    "depends_on": []
-                })
-                step_num += 1
-            if "explain_code" in capabilities:
-                steps.append({
-                    "step_number": step_num,
-                    "capability": "explain_code",
-                    "description": "Explain how the code works",
-                    "parameters": {},  # Will be injected from previous step
-                    "expected_output": "Code explanation",
-                    "depends_on": [step_num - 1] if step_num > 1 else []
-                })
-                step_num += 1
-        
-        elif "data" in part_lower or "analyze" in part_lower:
-            if "analyze_data" in capabilities:
-                steps.append({
-                    "step_number": step_num,
-                    "capability": "analyze_data",
-                    "description": "Analyze the data",
-                    "parameters": {"data": part},
-                    "expected_output": "Data analysis",
-                    "depends_on": []
-                })
-                step_num += 1
-    
-    # Fallback: If no steps were created, use answer_question as catch-all
-    if not steps and "answer_question" in capabilities:
-        steps.append({
-            "step_number": 1,
-            "capability": "answer_question",
-            "description": "Answer the question",
-            "parameters": {"question": task_description},
-            "expected_output": "Answer",
-            "depends_on": []
-        })
-    
-    print(f"   ✓ Created plan with {len(steps)} steps")
-    
+    """Minimal fallback plan used only when the LLM planner fails entirely.
+
+    Creates a single best-effort step.  Do NOT add keyword-based routing logic
+    here — all routing decisions are the LLM's responsibility, driven by the
+    capability descriptions that each agent registers in the service registry.
+    """
+    print("   ⚠️  LLM planner failed; creating minimal fallback plan")
+    fallback_cap = next(
+        (c for c in ["answer_question", "analyze_data"] if c in capabilities),
+        capabilities[0] if capabilities else "answer_question",
+    )
+    params: Dict[str, Any] = (
+        {"question": task_description}
+        if fallback_cap == "answer_question"
+        else {"data": task_description}
+    )
     return {
-        "steps": steps,
-        "reasoning": "Intelligent default plan created by parsing task structure and identifying sequential operations"
+        "steps": [
+            {
+                "step_number": 1,
+                "capability": fallback_cap,
+                "description": f"Execute: {task_description}",
+                "parameters": params,
+                "expected_output": "Result",
+                "depends_on": [],
+            }
+        ],
+        "reasoning": "Minimal fallback plan — LLM planner unavailable",
     }
 
 
 def create_default_plan(task_description: str, capabilities: List[str]) -> Dict[str, Any]:
-    """Deprecated: Use create_intelligent_default_plan instead"""
+    """Thin compatibility shim — delegates to create_intelligent_default_plan."""
     return create_intelligent_default_plan(task_description, capabilities)
+
+
+# NOTE: _fix_math_routing and the old keyword-matching create_intelligent_default_plan
+# have been removed.  Routing is entirely driven by the LLM using capability
+# descriptions + input_schema from the agent registry.
 
 
 async def generate_reflection(

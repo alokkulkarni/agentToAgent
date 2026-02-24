@@ -50,18 +50,39 @@ async def register_with_registry():
         capabilities=[
             AgentCapability(
                 name="answer_question",
-                description="Answer questions using LLM knowledge",
-                requires_llm=True
+                description="Answer research questions, explain concepts, describe topics, or gather factual knowledge using LLM. USE THIS for research and information tasks only — NEVER for arithmetic calculations.",
+                requires_llm=True,
+                input_schema={
+                    "parameters": {
+                        "question": {"type": "string", "required": True, "description": "The research question or topic to answer"}
+                    },
+                    "example": {"question": "What are the main benefits of microservices architecture?"}
+                }
             ),
             AgentCapability(
                 name="generate_report",
-                description="Generate detailed reports on topics",
-                requires_llm=True
+                description="Generate a structured written report on a topic. Accepts injected data from prior steps via 'data' or 'content' field.",
+                requires_llm=True,
+                input_schema={
+                    "parameters": {
+                        "topic": {"type": "string", "required": True, "description": "The subject of the report"},
+                        "aspects": {"type": "list[string]", "required": False, "description": "Specific aspects or sections to include"},
+                        "data": {"type": "string_or_step_ref", "required": False, "description": "Source data to base the report on. Leave empty — orchestrator injects prior step results."}
+                    },
+                    "example": {"topic": "AI in healthcare", "aspects": ["current trends", "challenges", "future outlook"], "data": ""}
+                }
             ),
             AgentCapability(
                 name="compare_concepts",
-                description="Compare and contrast concepts",
-                requires_llm=True
+                description="Compare and contrast two concepts side by side. Leave concept_a/concept_b empty when prior steps provide the research — the orchestrator injects them.",
+                requires_llm=True,
+                input_schema={
+                    "parameters": {
+                        "concept_a": {"type": "string", "required": False, "description": "First concept to compare. Leave empty if a prior step provides it."},
+                        "concept_b": {"type": "string", "required": False, "description": "Second concept to compare. Leave empty if a prior step provides it."}
+                    },
+                    "example": {"concept_a": "", "concept_b": ""}
+                }
             )
         ],
         has_llm=True,

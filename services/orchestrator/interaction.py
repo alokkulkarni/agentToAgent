@@ -3,7 +3,7 @@ Interaction manager for handling user input during workflow execution
 """
 import asyncio
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import logging
 
 from models import (
@@ -304,3 +304,11 @@ class InteractionManager:
         """Get single answered (but not completed) request for a workflow"""
         request = self.db.get_answered_interaction(workflow_id)
         return request
+
+    def get_all_answered_for_step(
+        self, workflow_id: str, step_id: str
+    ) -> List[InteractionRequest]:
+        """Return all answered/completed requests for a step in chronological order.
+        Used to build the full user_responses list when resuming a multi-turn step.
+        """
+        return self.db.get_completed_interactions_for_step(workflow_id, step_id)

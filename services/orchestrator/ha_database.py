@@ -577,6 +577,21 @@ class PostgreSQLWorkflowDatabase:
             row = cur.fetchone()
             return self._row_to_interaction(row) if row else None
 
+    def get_completed_interactions_for_step(
+        self, workflow_id: str, step_id: str
+    ) -> List:
+        """Return all answered/completed interaction requests for a step (oldest first)."""
+        with self.get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT * FROM interaction_requests
+                WHERE workflow_id = %s AND step_id = %s
+                  AND status IN ('answered', 'completed')
+                ORDER BY created_at ASC
+            """, (workflow_id, step_id))
+            rows = cur.fetchall()
+            return [self._row_to_interaction(r) for r in rows]
+
     def get_all_interaction_requests(self) -> List[Dict]:
         with self.get_connection() as conn:
             cur = conn.cursor()

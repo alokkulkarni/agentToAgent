@@ -49,18 +49,36 @@ async def register_with_registry():
         capabilities=[
             AgentCapability(
                 name="analyze_python_code",
-                description="Analyze Python code structure with AST",
-                requires_llm=False
+                description="Statically analyze Python code using AST: extract classes, functions, imports, complexity metrics.",
+                requires_llm=False,
+                input_schema={
+                    "parameters": {
+                        "code": {"type": "string", "required": True, "description": "Python source code to analyze"}
+                    },
+                    "example": {"code": "def hello():\n    print('hello')"}
+                }
             ),
             AgentCapability(
                 name="explain_code",
-                description="Explain code functionality using LLM",
-                requires_llm=True
+                description="Explain what a piece of code does in plain English using LLM.",
+                requires_llm=True,
+                input_schema={
+                    "parameters": {
+                        "code": {"type": "string", "required": True, "description": "Source code to explain"}
+                    },
+                    "example": {"code": "for i in range(10): print(i)"}
+                }
             ),
             AgentCapability(
                 name="suggest_improvements",
-                description="Suggest code improvements using LLM",
-                requires_llm=True
+                description="Suggest refactoring and quality improvements for a piece of code using LLM.",
+                requires_llm=True,
+                input_schema={
+                    "parameters": {
+                        "code": {"type": "string", "required": True, "description": "Source code to improve"}
+                    },
+                    "example": {"code": "x = []; \nfor i in range(10): x.append(i*i)"}
+                }
             )
         ],
         has_llm=True,

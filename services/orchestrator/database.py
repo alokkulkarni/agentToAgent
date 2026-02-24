@@ -644,6 +644,47 @@ class WorkflowDatabase:
                 status=row['status']
             )
     
+    def get_completed_interactions_for_step(
+        self, workflow_id: str, step_id: str
+    ) -> List['InteractionRequest']:
+        """Return all answered/completed interaction requests for a given step,
+        ordered chronologically (oldest first).  Used to reconstruct the full
+        multi-turn Q&A history when re-executing a paused step."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM interaction_requests
+                WHERE workflow_id = ? AND step_id = ?
+                  AND status IN ('answered', 'completed')
+                ORDER BY created_at ASC
+            """, (workflow_id, step_id))
+            rows = cursor.fetchall()
+
+            from models import InteractionRequest, InputType
+            import json as _json
+            results = []
+            for row in rows:
+                results.append(InteractionRequest(
+                    request_id=row['request_id'],
+                    workflow_id=row['workflow_id'],
+                    step_id=row['step_id'],
+                    agent_name=row['agent_name'],
+                    created_at=datetime.fromisoformat(row['created_at']),
+                    timeout_at=datetime.fromisoformat(row['timeout_at']) if row['timeout_at'] else None,
+                    question=row['question'],
+                    input_type=InputType(row['input_type']),
+                    options=_json.loads(row['options']) if row['options'] else None,
+                    default_value=_json.loads(row['default_value']) if row['default_value'] else None,
+                    context=_json.loads(row['context']) if row['context'] else {},
+                    reasoning=row['reasoning'],
+                    partial_results=_json.loads(row['partial_results']) if row['partial_results'] else None,
+                    response=_json.loads(row['response']) if row['response'] else None,
+                    response_received_at=datetime.fromisoformat(row['response_received_at']) if row['response_received_at'] else None,
+                    response_metadata=_json.loads(row['response_metadata']) if row['response_metadata'] else {},
+                    status=row['status']
+                ))
+            return results
+
     def get_all_interaction_requests(self) -> List[Dict]:
         """Get all interaction requests for debugging"""
         with self.get_connection() as conn:
