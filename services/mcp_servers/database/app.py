@@ -16,8 +16,10 @@ from pathlib import Path
 
 
 # Environment Configuration
-SERVER_HOST = os.getenv("MCP_DATABASE_HOST", "0.0.0.0")
+SERVER_HOST = os.getenv("MCP_DATABASE_HOST", "0.0.0.0")  # bind address
 SERVER_PORT = int(os.getenv("MCP_DATABASE_PORT", "8211"))
+# PUBLIC_HOST is the hostname other containers use to reach this server.
+PUBLIC_HOST = os.getenv("MCP_DATABASE_PUBLIC_HOST", "database-server")
 MCP_REGISTRY_URL = os.getenv("MCP_REGISTRY_URL", "http://localhost:8200")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "/tmp/mcp_database.db")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "info").lower()
@@ -354,7 +356,7 @@ async def register_with_registry():
         "server_id": server_id,
         "name": "DatabaseQueryServer",
         "description": "Provides database query operations (SQL queries, table inspection)",
-        "base_url": f"http://{SERVER_HOST}:{SERVER_PORT}",
+        "base_url": f"http://{PUBLIC_HOST}:{SERVER_PORT}",
         "tools": tools,
         "metadata": {
             "database": DATABASE_PATH,

@@ -14,8 +14,10 @@ from datetime import datetime, timezone
 
 
 # Environment Configuration
-SERVER_HOST = os.getenv("MCP_WEB_SEARCH_HOST", "127.0.0.1")
+SERVER_HOST = os.getenv("MCP_WEB_SEARCH_HOST", "0.0.0.0")  # bind address
 SERVER_PORT = int(os.getenv("MCP_WEB_SEARCH_PORT", "8212"))
+# PUBLIC_HOST is the hostname other containers use to reach this server.
+PUBLIC_HOST = os.getenv("MCP_WEB_SEARCH_PUBLIC_HOST", "web-search-server")
 MCP_REGISTRY_URL = os.getenv("MCP_REGISTRY_URL", "http://localhost:8200")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "info").lower()
 
@@ -263,7 +265,7 @@ async def register_with_registry():
         "server_id": server_id,
         "name": "WebSearchServer",
         "description": "Provides web search and content retrieval operations",
-        "base_url": f"http://{SERVER_HOST}:{SERVER_PORT}",
+        "base_url": f"http://{PUBLIC_HOST}:{SERVER_PORT}",
         "tools": tools,
         "metadata": {
             "capabilities": ["search", "fetch", "extract", "summarize"]
