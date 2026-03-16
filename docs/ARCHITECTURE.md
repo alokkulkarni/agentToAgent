@@ -2,7 +2,9 @@
 
 ## Overview
 
-The Agent-to-Agent (A2A) framework is a distributed, microservices-based system designed for autonomous multi-agent collaboration. It leverages AWS Bedrock for LLM capabilities and the Model Context Protocol (MCP) for standardized tool integration. The system is designed with enterprise-grade security, auditability, and context preservation at its core.
+The Agent-to-Agent (A2A) framework is a distributed, microservices-based system designed for autonomous multi-agent collaboration. It leverages **AWS Bedrock (Claude 3.5 Sonnet)** for LLM capabilities and the **Model Context Protocol (MCP)** for standardized tool integration. The system is designed with enterprise-grade security, auditability, high-availability, and context preservation at its core.
+
+**Current version**: 3.0 — adds HA multi-replica orchestrator, distributed state via Redis, Vector Memory with 10+ backends, WebSocket real-time interface, pluggable database backends, mustache inter-step template resolution, and a full Conversation + Thought Trail persistence layer.
 
 ### High-Level Architecture
 
@@ -16,41 +18,58 @@ The Agent-to-Agent (A2A) framework is a distributed, microservices-based system 
                   JWT Validate|                   |OBO Token
                    (JWKS/OIDC)|                   |Exchange
                               |                   |
-[ USER / CLI ] -(Bearer JWT)->+                   |
-      |                       |                   |
-      |              +--------+--------+          |
-[ INTERACTION ]      |   ORCHESTRATOR  |<---------+
-[ MANAGER     ]<---->|  (Port 8100)    |
-                     +--------+--------+
-                              |
-              +---------------+---------------+
-              |                               |
-     +--------+--------+           +----------+---------+
-     |  CONTEXT STORE  |           |   SECURITY LAYER   |
-     | (Session History|           | (Guardrails / PII  |
-     |  & State)       |           |  Vault / Audit Log)|
-     +-----------------+           +--------------------+
-                              |
-                     +--------+--------+
-                     |   AGENT MESH    |
-                     | (Research, Code,|
-                     |  Data, Math...) |
-                     +--------+--------+
-                              |
-            +-----------------+------------------+
-            |  MCP GATEWAY (Port 8300)           |
-            |  - Validates JWT                   |
-            |  - Fetches Tool Auth from Registry |
-            |  - Performs OBO Token Exchange     |
-            +--------+-----------+---------------+
-                     |           |
-         (Tool Token)|           |(Auth Schema)
-                     v           v
-            +--------+--+  +-----+-----------+
-            | MCP SERVERS|  |  MCP REGISTRY  |
-            | (Search,   |  | (Tool Auth     |
-            |  Calc, DB) |  |  Requirements) |
-            +------------+  +----------------+
+[ USER / CLI / WS ] -(Bearer JWT)->+              |
+      |                        |                  |
+      | WebSocket              |                  |
+      | (real-time)   +--------+--------+         |
+[ INTERACTION  ]      |   ORCHESTRATOR  |<--------+
+[ MANAGER      ]<---->|  (Port 8100)    |
+                      +--------+--------+
+                               |
+               +---------------+---------------+
+               |               |               |
+      +--------+--------+  +---+---+  +--------+---------+
+      |  CONTEXT STORE  |  | RETRY |  |  SECURITY LAYER  |
+      | (Conversation + |  | ENGINE|  | (Guardrails/PII  |
+      |  Thought Trail) |  |       |  |  Vault/Audit Log)|
+      +-----------------+  +-------+  +------------------+
+               |
+      +--------+--------+
+      |  VECTOR MEMORY  |
+      | (Qdrant/OpenSearch
+      |  /Redis/Pinecone)|
+      +--------+--------+
+               |
+      +--------+--------+
+      |   AGENT MESH    |
+      | (Research, Code,|
+      |  Data, Math...) |
+      +--------+--------+
+               |
+   +-----------+-------------------+
+   |  MCP GATEWAY (Port 8300)      |
+   |  - Validates JWT              |
+   |  - Fetches Tool Auth Schema   |
+   |  - Performs OBO Token Exchange|
+   +--------+-----------+----------+
+            |           |
+(Tool Token)|           |(Auth Schema)
+            v           v
+   +--------+--+  +-----+-----------+
+   | MCP SERVERS|  |  MCP REGISTRY  |
+   | (Search,   |  | (Tool Auth     |
+   |  Calc, DB) |  |  Requirements) |
+   +------------+  +----------------+
+
+   HA Shared State Layer:
+   +---------------------------------------------------+
+   | Redis: Workflow State | Session Store | Ownership |
+   |        Pub/Sub Fan-out | Instance Registry        |
+   |                                                   |
+   | PostgreSQL / SQLite: Workflow + Step records,     |
+   |  Conversation messages, Thought trail, Interaction|
+   |  requests + responses                             |
+   +---------------------------------------------------+
 ```
 
 ---
@@ -59,24 +78,51 @@ The Agent-to-Agent (A2A) framework is a distributed, microservices-based system 
 
 ### Orchestrator (Port 8100)
 The central nervous system of the framework.
-- **Workflow Planning**: Uses Claude 3.5 Sonnet to decompose user requests into executable steps.
-- **Context Management**: Maintains global conversation history across multiple workflows using a `session_id`.
-- **State Management**: Persists workflow state in SQLite/PostgreSQL.
+- **Workflow Planning**: Uses Claude 3.5 Sonnet to decompose user requests into dependency-ordered, executable steps.
+- **Context Management**: Maintains global conversation history across multiple workflows using a `session_id`. Aggregates summaries of prior workflows and injects them into new planner prompts.
+- **State Management**: Persists all workflow, step, conversation, thought trail, and interaction records via a pluggable `WorkflowDatabase` (SQLite default, PostgreSQL for production).
+- **Context Enrichment**: Resolves `{{step_id.result}}` mustache templates at execution time, passing outputs from earlier steps as inputs to later steps.
 - **Authentication**: Validates JWT tokens via `shared/auth_dependencies.py`; injects `UserContext` into all workflow executions.
-- **Security Integration**: Enforces identity propagation and guardrails.
+- **Security Integration**: Enforces guardrails, PII vault, audit logging, and identity propagation.
 
-### Interaction Manager
-Handles human-in-the-loop scenarios.
-- **Suspension**: Pauses workflows when agent requires user input.
-- **Resumption**: Resumes execution with user feedback.
-- **Context Switching**: Allows users to branch off into new tasks while keeping the original workflow paused.
+### Interaction Manager (`orchestrator/interaction.py`)
+Handles human-in-the-loop scenarios with first-class database + WebSocket support.
+- **Suspension**: Pauses workflows when an agent returns a `user_input_required` response; transitions status to `waiting_for_input`.
+- **Resumption**: Resumes execution from the suspended step with user response injected into agent context; transitions to `running`.
+- **Timeout Handling**: Auto-transitions to `input_timeout` if no response is received within a configurable window (`default_timeout_seconds`).
+- **Input Types**: `text`, `single_choice`, `multiple_choice`, `confirmation`, `file_upload`, `number`, `date`, `rating`, `scale`.
+- **Persistence**: `InteractionRequest` and `InteractionResponse` are stored in the database, enabling audit and replay.
+
+### WebSocket Handler (`orchestrator/websocket_handler.py`)
+Real-time bidirectional interface for interactive workflows.
+- **ConnectionManager**: Maintains a `workflow_id → Set[WebSocket]` map with async locking.
+- **Fan-out**: Broadcasts status updates, thought trail entries, agent messages, and interaction requests to all connected clients for a workflow.
+- **Cross-Instance Fan-out (HA)**: When Redis pub/sub is configured (`HA_BACKEND=redis`), events are published cross-replica so any connected client — on any orchestrator instance — receives updates.
+- **Events**: `connection_established`, `workflow_status`, `agent_thought`, `interaction_request`, `workflow_complete`, `workflow_error`.
+
+### Parallel Executor (`orchestrator/executor.py`)
+Dependency-graph-aware concurrent step execution.
+- **Dependency Graph**: Builds a DAG from `StepRecord.dependencies` (list of step IDs).
+- **Ready Steps**: Continuously identifies steps whose dependencies are all completed.
+- **Semaphore Control**: `asyncio.Semaphore(max_parallel_steps)` caps concurrency.
+- **Per-Step Timeout**: `asyncio.wait_for` with a configurable `step_timeout_seconds`.
+
+### Retry Manager (`orchestrator/retry.py`)
+- **Exponential Backoff**: `initial_delay * (base ** retry_count)` capped at `max_delay_seconds`.
+- **Jitter**: Random multiplier in `[0.5, 1.5]` to prevent thundering herd.
+- **Retriable Error Classification**: Configurable list of error substrings that trigger a retry.
+
+### Conversation Manager (`orchestrator/conversation.py`)
+- **Per-workflow context**: Tracks `ConversationMessage` records (role: `user | agent | orchestrator | system`; type: `task | message | thought | result | interaction_request | interaction_response`).
+- **Thought Trail**: Separate `ThoughtTrailEntry` records log orchestrator reasoning steps (type: `reasoning | planning | observation | decision`).
+- **Persistence**: All records saved to the workflow database; full history retrievable for audit or replay.
 
 ### Security Layer
 Enterprise-grade security features embedded in the framework.
-- **SafeLLMClient**: A wrapper around AWS Bedrock client that enforces input/output guardrails.
-- **PII Vault**: Tokenizes sensitive data (Credit Cards, SSN) before sending to LLM; detokenizes for authorized tool calls.
-- **Audit Logger**: WORM (Write Once Read Many) compliant logging of "Thought, Plan, Observation, Action".
-- **Identity Propagation**: Propagates User ID and Roles (IAM style) to every agent and tool.
+- **SafeLLMClient (`shared/llm_client.py`)**: A wrapper around the AWS Bedrock client that enforces input/output guardrails before and after every LLM call.
+- **PII Vault (`shared/security.py`)**: Regex-based detection and UUID tokenization of credit cards, SSNs, and email addresses. Only authorized tools can call the detokenization API; the LLM never receives raw sensitive values.
+- **Audit Logger (`shared/audit.py`)**: WORM-compliant cryptographic chain logging. Each entry includes `{timestamp, trace_id, actor, action, thought, input, output, hash}` where `hash = SHA256(previous_hash + current_entry)`.
+- **Identity Propagation**: Propagates `UserContext` (user_id, roles, scopes, tenant_id) to every agent call and MCP tool execution via HTTP headers.
 
 ### MCP Gateway (Port 8300)
 The router for tool execution.
