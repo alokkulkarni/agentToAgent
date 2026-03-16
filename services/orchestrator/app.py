@@ -119,52 +119,71 @@ async def enrich_with_workflow_context(
                 print(f"         ✓ Resolved mustache template in '{key}'")
 
     # Strategy 0: Generic template replacement for <result_from_step_N> and <output from step N>
+    # Handles ALL placeholders in each string value, even when some steps failed.
     import re
-    
-    for key, value in list(enriched.items()):
-        if isinstance(value, str):
-            # Match <result_from_step_1>, <output from step 2>, <output_from_step_2>, etc.
-            pattern = r'<(?:result_from_step_|output_from_step_|output from step\s*)(\d+)>'
-            match = re.search(pattern, value, re.IGNORECASE)
-            
-            if match:
-                step_num = match.group(1)
-                step_key = f"step_{step_num}"
-                
-                if step_key in step_results:
-                    result = step_results[step_key]["result"]
-                    
-                    # Helper to extract scalar from dict (redefined here for scope)
-                    def extract_scalar_recursive(data):
-                        if not isinstance(data, dict):
-                            return data
-                        # If this dict is itself an error payload, return None so callers
-                        # know not to inject this value into downstream parameters.
-                        if "error" in data and len(data) == 1:
-                            return None
-                        for key in ["result", "answer", "output", "value", "content"]:
-                            if key in data:
-                                val = data[key]
-                                if isinstance(val, dict):
-                                    inner = extract_scalar_recursive(val)
-                                    # Propagate None (error) upward
-                                    return inner
-                                return val
-                        return data
+    import json as _json
 
-                    # If result is a dict with common output keys, extract the value
-                    if isinstance(result, dict):
-                        extracted = extract_scalar_recursive(result)
-                        if extracted is None:
-                            # Step result is an error — skip injection so downstream steps
-                            # keep the placeholder and fail with a clear message.
-                            print(f"         ⚠️  Step {step_num} result is an error — skipping injection")
-                        else:
-                            enriched[key] = extracted
-                            print(f"         ✓ Injected extracted value from step {step_num}")
+    def _extract_scalar_recursive(data):
+        """Extract a representative scalar/string from a result dict."""
+        if not isinstance(data, dict):
+            return data
+        # Single-key error payload – signal failure
+        if "error" in data and len(data) == 1:
+            return None
+        for _k in ["result", "answer", "output", "value", "content"]:
+            if _k in data:
+                val = data[_k]
+                if isinstance(val, dict):
+                    return _extract_scalar_recursive(val)
+                return val
+        return data
+
+    _placeholder_pattern = r'<(?:result_from_step_|output_from_step_|output from step\s*)(\d+)>'
+
+    for _param_key, _param_value in list(enriched.items()):
+        if not isinstance(_param_value, str):
+            continue
+        _all_step_nums = re.findall(_placeholder_pattern, _param_value, re.IGNORECASE)
+        if not _all_step_nums:
+            continue
+
+        _new_value = _param_value
+        _replaced_count = 0
+        for _step_num in _all_step_nums:
+            _step_key = f"step_{_step_num}"
+            # Build a regex that matches this specific placeholder
+            _specific_pat = r'<(?:result_from_step_|output_from_step_|output from step\s*)' + _step_num + r'>'
+
+            if _step_key in step_results:
+                _raw_result = step_results[_step_key]["result"]
+                if isinstance(_raw_result, dict):
+                    _extracted = _extract_scalar_recursive(_raw_result)
+                    if _extracted is None:
+                        # Step produced an error — inject a descriptive note
+                        _replacement = f"[Step {_step_num} failed — no data available]"
+                        print(f"         ⚠️  Step {_step_num} result is an error — injecting note")
                     else:
-                        enriched[key] = result
-                        print(f"         ✓ Injected result from step {step_num}")
+                        if isinstance(_extracted, (dict, list)):
+                            _replacement = _json.dumps(_extracted)
+                        else:
+                            _replacement = str(_extracted)
+                        _replaced_count += 1
+                        print(f"         ✓ Injected extracted value from step {_step_num}")
+                else:
+                    _replacement = str(_raw_result)
+                    _replaced_count += 1
+                    print(f"         ✓ Injected result from step {_step_num}")
+            else:
+                # Step not recorded (failed before completion or not yet run)
+                _replacement = f"[Step {_step_num} did not produce results]"
+                print(f"         ⚠️  Step {_step_num} not in results — injecting note")
+
+            # Replace only the specific placeholder (escape replacement to avoid regex issues)
+            _new_value = re.sub(_specific_pat, lambda _m, r=_replacement: r, _new_value, flags=re.IGNORECASE)
+
+        if _new_value != _param_value:
+            enriched[_param_key] = _new_value
+            print(f"         ✓ Resolved {len(_all_step_nums)} placeholder(s) in '{_param_key}' ({_replaced_count} with real data)")
     
     # Strategy 1: Generic Input Chaining
     # This replaces specific capability checks (math, transform, etc.) with a generic heuristic.
@@ -270,12 +289,16 @@ async def enrich_with_workflow_context(
                 print(f"         ✓ Injected analyzed code")
     
     elif capability == "summarize_data":
-        if "data" not in enriched:
-            # Summarize all previous outputs
+        _data_val = enriched.get("data")
+        _has_unresolved = isinstance(_data_val, str) and re.search(
+            r'<(?:result_from_step_|output_from_step_|output from step\s*)\d+>', _data_val, re.IGNORECASE
+        )
+        if "data" not in enriched or _has_unresolved:
+            # Aggregate all previous step results for summarisation
             enriched["data"] = {
                 k: v["result"] for k, v in step_results.items()
             }
-            print(f"         ✓ Injected all previous step results")
+            print(f"         ✓ Injected all previous step results ({len(step_results)} steps)")
     
     elif capability == "analyze_data":
         # Check if data parameter is a placeholder or missing
