@@ -55,6 +55,10 @@ class ToolCall(BaseModel):
     tool_name: str
     parameters: Dict[str, Any]
     prefer_server: Optional[str] = None
+    # Trace context — propagated from orchestrator for end-to-end observability
+    workflow_id: Optional[str] = None
+    session_id: Optional[str] = None
+    user_id: Optional[str] = None
 
 
 class GatewayRequest(BaseModel):
@@ -393,6 +397,14 @@ async def execute_tool(
 async def execute_tool(tool_call: ToolCall):
     """Execute a specific tool directly"""
     
+    if tool_call.workflow_id:
+        print(
+            f"[MCP] execute tool={tool_call.tool_name}"
+            f" workflow={tool_call.workflow_id}"
+            f" session={tool_call.session_id or '-'}"
+            f" user={tool_call.user_id or '-'}"
+        )
+
     # Find server for tool
     server_info = await find_server_for_tool(tool_call.tool_name, tool_call.prefer_server)
     

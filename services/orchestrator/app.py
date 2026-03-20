@@ -429,10 +429,26 @@ REGISTRY_URL = os.getenv("REGISTRY_URL", "http://localhost:8000")
 AWS_REGION = os.getenv("AWS_REGION", "eu-west-2")
 BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20241022-v2:0")
 
+# ── LLM provider selection ─────────────────────────────────────────────────
+# LLM_PROVIDER=direct   → use AWS Bedrock directly (default, existing behaviour)
+# LLM_PROVIDER=model_gateway → route all LLM calls through the Model Gateway
+#   service, which provides multi-provider routing, fallback, and audit.
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "direct").strip().lower()
+
+# Model Gateway settings (used when LLM_PROVIDER=model_gateway)
+MODEL_GATEWAY_URL = os.getenv("MODEL_GATEWAY_URL", "http://model-gateway:8400").rstrip("/")
+# Optional: hint the gateway which model family to prefer.  Leave blank to let
+# the gateway select automatically based on task type and cost tier.
+MODEL_GATEWAY_PREFERRED_MODEL = os.getenv("MODEL_GATEWAY_PREFERRED_MODEL", "").strip() or None
+# Optional: force a specific cost tier for every model gateway call.
+# Valid values: premium | standard | economy  (leave blank to let the gateway decide)
+ORCHESTRATOR_COST_TIER = os.getenv("ORCHESTRATOR_COST_TIER", "").strip() or None
+
 # Global state
 orchestrator_id = None
 registry_client = None
-bedrock_client = None
+bedrock_client = None   # boto3 bedrock-runtime client; None when using model_gateway
+_gateway_http_client = None  # httpx.AsyncClient; None when using direct Bedrock
 # NOTE: active_workflows was a per-process dict and has been replaced by
 # dist_state.workflows — a shared, Redis-backed store for HA deployments.
 # All former `active_workflows[...]` usages now go through dist_state.
@@ -514,6 +530,179 @@ def init_bedrock():
     print(f"✓ Bedrock client initialized (region: {AWS_REGION}, model: {BEDROCK_MODEL_ID})")
 
 
+def init_llm_client():
+    """
+    Initialise the LLM back-end selected by LLM_PROVIDER.
+
+    * LLM_PROVIDER=direct (default) — creates a boto3 bedrock-runtime client
+      exactly as before; behaviour is 100% backward-compatible.
+    * LLM_PROVIDER=model_gateway — creates an httpx.AsyncClient pointing at the
+      Model Gateway service.  All LLM calls are then routed through the gateway,
+      giving multi-provider routing, circuit-breaker fallback, and a unified
+      audit trail.  Direct Bedrock credentials are NOT required in this mode.
+    """
+    global bedrock_client, _gateway_http_client
+
+    if LLM_PROVIDER == "model_gateway":
+        import httpx
+        _gateway_http_client = httpx.AsyncClient(
+            base_url=MODEL_GATEWAY_URL,
+            timeout=120.0,
+            headers={"Content-Type": "application/json"},
+        )
+        print(f"✓ LLM provider: Model Gateway  ({MODEL_GATEWAY_URL})")
+        if MODEL_GATEWAY_PREFERRED_MODEL:
+            print(f"  preferred model hint: {MODEL_GATEWAY_PREFERRED_MODEL}")
+        return
+
+    # Default: direct Bedrock
+    init_bedrock()
+
+
+async def _llm_converse(
+    modelId: str,
+    messages: list,
+    system: list = None,
+    inferenceConfig: dict = None,
+    workflow_id: str = None,
+    session_id: str = None,
+    user_id: str = None,
+    cost_tier: str = None,
+) -> dict:
+    """
+    Unified async LLM call that dispatches to either:
+      • AWS Bedrock directly (LLM_PROVIDER=direct)
+      • Model Gateway /v1/complete (LLM_PROVIDER=model_gateway)
+
+    Always returns a dict in the Bedrock ``converse()`` response shape so that
+    all callers can read ``response['output']['message']['content'][0]['text']``
+    regardless of which back-end is active.
+    """
+    if LLM_PROVIDER == "model_gateway":
+        return await _gateway_converse(
+            messages=messages,
+            system=system,
+            inferenceConfig=inferenceConfig,
+            workflow_id=workflow_id,
+            session_id=session_id,
+            user_id=user_id,
+            cost_tier=cost_tier or ORCHESTRATOR_COST_TIER,
+        )
+
+    # Direct Bedrock — boto3 is synchronous; run in a thread to avoid
+    # blocking the asyncio event loop.
+    import asyncio
+    kwargs: dict = {"modelId": modelId, "messages": messages}
+    if system:
+        kwargs["system"] = system
+    if inferenceConfig:
+        kwargs["inferenceConfig"] = inferenceConfig
+    return await asyncio.get_event_loop().run_in_executor(
+        None, lambda: bedrock_client.converse(**kwargs)
+    )
+
+
+async def _gateway_converse(
+    messages: list,
+    system: list = None,
+    inferenceConfig: dict = None,
+    workflow_id: str = None,
+    session_id: str = None,
+    user_id: str = None,
+    cost_tier: str = None,
+) -> dict:
+    """
+    POST to Model Gateway /v1/complete and translate the response into the
+    Bedrock ``converse()`` response shape expected by the orchestrator.
+
+    Message translation:
+      Bedrock  →  {"role": "user", "content": [{"text": "..."}]}
+      Gateway  →  {"role": "user", "content": "..."}   (plain string)
+
+    System prompt:
+      Bedrock  →  system=[{"text": "..."}]
+      Gateway  →  system_prompt="..."   (plain string)
+    """
+    inference = inferenceConfig or {}
+    max_tokens = inference.get("maxTokens", 4096)
+    temperature = inference.get("temperature", 0.7)
+
+    # Flatten system blocks into a single string
+    system_prompt: str = None
+    if system:
+        system_prompt = "\n".join(
+            block.get("text", "") if isinstance(block, dict) else str(block)
+            for block in system
+        ).strip() or None
+
+    # Translate Bedrock content blocks → plain strings for the gateway
+    gw_messages = []
+    for msg in messages:
+        raw_content = msg.get("content", "")
+        if isinstance(raw_content, list):
+            # e.g. [{"text": "hello"}, {"text": " world"}]
+            text = " ".join(
+                block.get("text", "") if isinstance(block, dict) else str(block)
+                for block in raw_content
+                if not isinstance(block, dict) or "text" in block
+            )
+        else:
+            text = str(raw_content)
+        gw_messages.append({"role": msg["role"], "content": text})
+
+    payload: dict = {
+        "messages": gw_messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if system_prompt:
+        payload["system_prompt"] = system_prompt
+    if MODEL_GATEWAY_PREFERRED_MODEL:
+        payload["preferred_model"] = MODEL_GATEWAY_PREFERRED_MODEL
+    if workflow_id:
+        payload["workflow_id"] = workflow_id
+    if session_id:
+        payload["session_id"] = session_id
+    if user_id:
+        payload["user_id"] = user_id
+    if cost_tier:
+        payload["cost_tier"] = cost_tier
+
+    try:
+        resp = await _gateway_http_client.post("/v1/complete", json=payload)
+        resp.raise_for_status()
+        gw = resp.json()
+    except Exception as exc:
+        raise RuntimeError(f"Model Gateway request failed: {exc}") from exc
+
+    # Translate gateway response → Bedrock converse() shape
+    content_text = gw.get("content", "")
+    usage = gw.get("usage", {})
+    return {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [{"text": content_text}],
+            }
+        },
+        "usage": {
+            "inputTokens": usage.get("input_tokens", 0),
+            "outputTokens": usage.get("output_tokens", 0),
+        },
+        "stopReason": gw.get("finish_reason", "end_turn"),
+        # Extra metadata — available for logging/debugging; not parsed by callers
+        "_gateway_meta": {
+            "model_id": gw.get("model_id"),
+            "provider": gw.get("provider"),
+            "fallback_used": gw.get("fallback_used", False),
+            "detected_task": gw.get("detected_task"),
+            "selection_reason": gw.get("selection_reason"),
+            "request_id": gw.get("request_id"),
+            "latency_ms": gw.get("latency_ms"),
+        },
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle management"""
@@ -536,8 +725,8 @@ async def lifespan(app: FastAPI):
     await dist_state.startup()
     print(f"✓ Distributed state started — backend={dist_state.backend.value} instance={dist_state.instance_id}")
     
-    # Initialize Bedrock
-    init_bedrock()
+    # Initialize LLM client (Bedrock direct or Model Gateway)
+    init_llm_client()
     
     # Register with registry
     await register_with_registry()
@@ -551,6 +740,9 @@ async def lifespan(app: FastAPI):
     if registry_client and orchestrator_id:
         await registry_client.unregister_agent(orchestrator_id)
         await registry_client.close()
+    # Close Model Gateway HTTP client if it was opened
+    if _gateway_http_client:
+        await _gateway_http_client.aclose()
     # Graceful distributed state shutdown (deregisters instance, closes connections)
     await dist_state.shutdown()
 
@@ -813,7 +1005,8 @@ async def _execute_workflow_internal(workflow_id: str, task_description: str, he
         
         plan = await generate_dynamic_plan(
             task_description, capabilities, capability_descriptions,
-            session_history, capability_schemas
+            session_history, capability_schemas,
+            workflow_id=workflow_id, session_id=session_id, user_id=user_id,
         )
         
         print(f"   Generated plan with {len(plan.get('steps', []))} steps")
@@ -919,6 +1112,8 @@ async def _execute_workflow_internal(workflow_id: str, task_description: str, he
                 parameters=enriched_parameters,
                 context={
                     "workflow_id": workflow_id,
+                    "session_id": session_id,
+                    "user_id": user_id,
                     "step_number": step_num,
                     "step_id": f"step_{step_num}",
                     "agent_name": agent_name,
@@ -1210,7 +1405,10 @@ async def _execute_workflow_internal(workflow_id: str, task_description: str, he
             plan=plan,
             workflow_context=workflow_context,
             completed_steps=len(workflow_state["completed_steps"]),
-            total_steps=len(plan.get('steps', []))
+            total_steps=len(plan.get('steps', [])),
+            workflow_id=workflow_id,
+            session_id=session_id,
+            user_id=user_id,
         )
         
         print(f"   Reflection: {reflection.get('summary', 'N/A')}")
@@ -1409,6 +1607,8 @@ async def resume_workflow(workflow_id: str) -> Dict[str, Any]:
             parameters=enriched_parameters,
             context={
                 "workflow_id": workflow_id,
+                "session_id": workflow_state.get("session_id"),
+                "user_id": workflow_context.get("user_id"),
                 "step_number": pause_step,
                 "step_id": f"step_{pause_step}",
                 "agent_name": agent_name,
@@ -1551,6 +1751,8 @@ async def resume_workflow(workflow_id: str) -> Dict[str, Any]:
                     parameters=enriched_parameters,
                     context={
                         "workflow_id": workflow_id,
+                        "session_id": workflow_state.get("session_id"),
+                        "user_id": workflow_context.get("user_id"),
                         "step_number": step_num,
                         "step_id": f"step_{step_num}",
                         "agent_name": agent_name,
@@ -1644,7 +1846,10 @@ async def resume_workflow(workflow_id: str) -> Dict[str, Any]:
                 plan=plan,
                 workflow_context=workflow_context,
                 completed_steps=len(workflow_state["completed_steps"]),
-                total_steps=len(plan['steps'])
+                total_steps=len(plan['steps']),
+                workflow_id=workflow_id,
+                session_id=workflow_state.get("session_id"),
+                user_id=workflow_context.get("user_id"),
             )
             
             result = {
@@ -1833,6 +2038,9 @@ async def generate_dynamic_plan(
     capability_descriptions: Dict[str, str],
     session_history: List[Dict] = None,
     capability_schemas: Dict[str, Any] = None,
+    workflow_id: str = None,
+    session_id: str = None,
+    user_id: str = None,
 ) -> Dict[str, Any]:
     """
     Generate a dynamic execution plan using the LLM.
@@ -1904,6 +2112,11 @@ RULES:
 8. Set parameters to empty string / empty list when the orchestrator will inject prior \
    step results (this is noted in each capability's description).
 9. Return ONLY valid JSON — no markdown, no code fences, no extra text.
+10. REAL-TIME DATA RULE (MANDATORY): If the task asks for ANY real-time or live information \
+    — current time, today's date, live prices, current weather, recent news, sports scores, \
+    or anything an LLM cannot know without internet access — you MUST use `search_web` \
+    (if available in the list), NOT `answer_question`. This rule overrides all other routing \
+    considerations for such queries.
 
 RESPONSE FORMAT:
 {
@@ -1925,17 +2138,21 @@ RESPONSE FORMAT:
         user_message += history_str
     user_message += f"\nAVAILABLE CAPABILITIES (registered by live agents):\n\n{capability_docs}\n\nGenerate the execution plan JSON."
 
-    print(f"   Calling Bedrock with model: {BEDROCK_MODEL_ID}")
+    provider_label = "Model Gateway" if LLM_PROVIDER == "model_gateway" else "Bedrock"
+    print(f"   Calling {provider_label} with model: {BEDROCK_MODEL_ID}")
     print(f"   Temperature: 0.1 (low for structured output)")
     if session_history:
         print(f"   Generating plan with {len(session_history)} history items")
 
     try:
-        response = bedrock_client.converse(
+        response = await _llm_converse(
             modelId=BEDROCK_MODEL_ID,
             system=[{"text": system_instruction}],
             messages=[{"role": "user", "content": [{"text": user_message}]}],
-            inferenceConfig={"maxTokens": 4000, "temperature": 0.1}
+            inferenceConfig={"maxTokens": 4000, "temperature": 0.1},
+            workflow_id=workflow_id,
+            session_id=session_id,
+            user_id=user_id,
         )
         
         content = response['output']['message']['content'][0]['text']
@@ -2074,7 +2291,10 @@ async def generate_reflection(
     plan: Dict[str, Any],
     workflow_context: Dict[str, Any],
     completed_steps: int,
-    total_steps: int
+    total_steps: int,
+    workflow_id: str = None,
+    session_id: str = None,
+    user_id: str = None,
 ) -> Dict[str, Any]:
     """
     Generate reflection on workflow execution using LLM.
@@ -2128,11 +2348,14 @@ ANALYZE:
 5. What could be improved?"""
     
     try:
-        response = bedrock_client.converse(
+        response = await _llm_converse(
             modelId=BEDROCK_MODEL_ID,
             system=[{"text": system_instruction}],
             messages=[{"role": "user", "content": [{"text": user_context}]}],
-            inferenceConfig={"maxTokens": 2000, "temperature": 0.5}
+            inferenceConfig={"maxTokens": 2000, "temperature": 0.5},
+            workflow_id=workflow_id,
+            session_id=session_id,
+            user_id=user_id,
         )
         
         content = response['output']['message']['content'][0]['text']

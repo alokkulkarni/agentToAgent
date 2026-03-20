@@ -719,8 +719,13 @@ class BedrockProvider(BaseProvider):
         self._refresh_client_if_needed()
         try:
             t0 = time.monotonic()
-            # Lightweight probe: describe the most commonly used model
-            probe_model = "anthropic.claude-3-5-haiku-20241022-v1:0"
+            # Use an Amazon-native Nova Micro model for the probe — it is
+            # available in all Bedrock regions and requires no model-access
+            # grant.  Override with BEDROCK_HEALTH_PROBE_MODEL if needed.
+            probe_model = os.getenv(
+                "BEDROCK_HEALTH_PROBE_MODEL",
+                "amazon.nova-micro-v1:0",
+            )
             await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: self._client.converse(

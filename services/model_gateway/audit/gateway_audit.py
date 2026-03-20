@@ -113,12 +113,15 @@ class GatewayAuditLogger:
         fallbacks: List[str],
         estimated_cost_per_1k: Optional[float] = None,
         workflow_id: Optional[str] = None,
+        session_id: Optional[str] = None,
         user_id: Optional[str] = None,
+        cost_tier: Optional[str] = None,
     ) -> None:
         self.log(GatewayAuditEvent(
             event_type=GatewayAuditEventType.MODEL_SELECTION,
             request_id=request_id,
             workflow_id=workflow_id,
+            session_id=session_id,
             user_id=user_id,
             details={
                 "selected_model": selected_model,
@@ -127,6 +130,7 @@ class GatewayAuditLogger:
                 "reason": reason,
                 "fallback_chain": fallbacks,
                 "estimated_cost_usd_per_1k_tokens": estimated_cost_per_1k,
+                "requested_cost_tier": cost_tier,
             },
         ))
 

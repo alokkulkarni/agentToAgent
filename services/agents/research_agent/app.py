@@ -49,8 +49,20 @@ async def register_with_registry():
         role=AgentRole.SPECIALIZED,
         capabilities=[
             AgentCapability(
+                name="search_web",
+                description="Search the web for real-time, live, or current information. USE THIS for: current time in any city/timezone, today's date, live prices, current weather, breaking news, recent events, sports scores, or any query needing up-to-date data that an LLM cannot know. ALWAYS prefer this over answer_question when the query asks for anything 'current', 'now', 'today', 'latest', or 'live'.",
+                requires_llm=False,
+                input_schema={
+                    "parameters": {
+                        "query": {"type": "string", "required": True, "description": "The web search query to look up"},
+                        "max_results": {"type": "integer", "required": False, "description": "Max number of results to return (default 5)"}
+                    },
+                    "example": {"query": "current time in London", "max_results": 5}
+                }
+            ),
+            AgentCapability(
                 name="answer_question",
-                description="Answer research questions, explain concepts, describe topics, or gather factual knowledge using LLM. USE THIS for research and information tasks only — NEVER for arithmetic calculations.",
+                description="Answer research questions, explain concepts, describe topics, or gather factual knowledge using LLM knowledge. USE THIS for conceptual questions, explanations, and historical knowledge — NOT for real-time data like current time, live prices, weather, or recent events (use search_web for those instead). NEVER use for arithmetic calculations.",
                 requires_llm=True,
                 input_schema={
                     "parameters": {
@@ -135,17 +147,30 @@ def init_bedrock():
     print(f"  - Audit Logging: Enabled")
 
 
-async def call_mcp_gateway(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+async def call_mcp_gateway(
+    tool_name: str,
+    arguments: Dict[str, Any],
+    workflow_id: str = None,
+    session_id: str = None,
+    user_id: str = None,
+) -> Dict[str, Any]:
     """Call MCP Gateway to execute tool"""
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             print(f"      calling MCP Gateway tool: {tool_name}")
+            body: Dict[str, Any] = {
+                "tool_name": tool_name,
+                "parameters": arguments,
+            }
+            if workflow_id:
+                body["workflow_id"] = workflow_id
+            if session_id:
+                body["session_id"] = session_id
+            if user_id:
+                body["user_id"] = user_id
             response = await client.post(
                 f"{MCP_GATEWAY_URL}/api/gateway/execute",
-                json={
-                    "tool_name": tool_name,
-                    "parameters": arguments
-                }
+                json=body,
             )
             response.raise_for_status()
             result = response.json()
@@ -181,12 +206,15 @@ Respond with JSON: {"needs_search": true/false, "reason": "..."}"""
         return False
 
 
-async def perform_web_research(query: str) -> str:
+async def perform_web_research(query: str, workflow_id: str = None, session_id: str = None, user_id: str = None) -> str:
     """Perform web research using MCP"""
     print(f"      🔍 Performing web research for: {query}")
     
     # 1. Search Web
-    search_result = await call_mcp_gateway("search_web", {"query": query, "max_results": 3})
+    search_result = await call_mcp_gateway(
+        "search_web", {"query": query, "max_results": 3},
+        workflow_id=workflow_id, session_id=session_id, user_id=user_id,
+    )
     
     context = ""
     if "result" in search_result and "results" in search_result["result"]:
@@ -253,6 +281,12 @@ async def execute_task(task: TaskRequest) -> TaskResponse:
     """Execute a task"""
     print(f"Executing task: {task.task_id} - {task.capability}")
     
+    # Extract trace IDs from task context for end-to-end traceability
+    _ctx = task.context or {}
+    _wf_id = _ctx.get("workflow_id")
+    _sess_id = _ctx.get("session_id")
+    _user_id = _ctx.get("user_id")
+
     # Inject context into parameters to ensure AgentInteractionHelper works correctly
     if task.context:
         task.parameters["_workflow_context"] = task.context
@@ -261,12 +295,14 @@ async def execute_task(task: TaskRequest) -> TaskResponse:
     start_time = datetime.utcnow()
     
     try:
-        if task.capability == "answer_question":
-            result = await answer_question(task.parameters)
+        if task.capability == "search_web":
+            result = await search_web(task.parameters, workflow_id=_wf_id, session_id=_sess_id, user_id=_user_id)
+        elif task.capability == "answer_question":
+            result = await answer_question(task.parameters, workflow_id=_wf_id, session_id=_sess_id, user_id=_user_id)
         elif task.capability == "generate_report":
-            result = await generate_report(task.parameters)
+            result = await generate_report(task.parameters, workflow_id=_wf_id, session_id=_sess_id, user_id=_user_id)
         elif task.capability == "compare_concepts":
-            result = await compare_concepts(task.parameters)
+            result = await compare_concepts(task.parameters, workflow_id=_wf_id, session_id=_sess_id, user_id=_user_id)
         else:
             raise ValueError(f"Unknown capability: {task.capability}")
         
@@ -289,7 +325,76 @@ async def execute_task(task: TaskRequest) -> TaskResponse:
         )
 
 
-async def answer_question(parameters: Dict[str, Any]) -> Dict[str, Any]:
+async def search_web(parameters: Dict[str, Any], workflow_id: str = None, session_id: str = None, user_id: str = None) -> Dict[str, Any]:
+    """
+    Directly search the web via the MCP web-search tool and return the results.
+    Designed for real-time queries: current time, live prices, weather, recent news, etc.
+    Does NOT invoke the LLM — returns raw search results so the orchestrator or
+    caller can surface the live data directly.
+    """
+    query = parameters.get("query") or parameters.get("question") or parameters.get("q")
+    if not query:
+        raise ValueError("query parameter is required")
+
+    max_results = int(parameters.get("max_results", 5))
+
+    print(f"      🔍 search_web: '{query}' (max_results={max_results})")
+
+    search_result = await call_mcp_gateway(
+        "search_web",
+        {"query": query, "max_results": max_results},
+        workflow_id=workflow_id,
+        session_id=session_id,
+        user_id=user_id,
+    )
+
+    results = []
+    # Response structure: MCP gateway wraps as {"result": <server_response>}
+    # and the web-search server itself wraps as {"result": <tool_output>}
+    # so the actual tool output is at search_result["result"]["result"]
+    gateway_result = search_result.get("result", search_result)
+    tool_output = gateway_result.get("result", gateway_result) if isinstance(gateway_result, dict) else {}
+    raw_results = tool_output.get("results", [])
+
+    if "error" in search_result:
+        return {
+            "query": query,
+            "answer": f"Web search failed: {search_result['error']}",
+            "results": [],
+            "search_performed": True,
+        }
+
+    for r in raw_results:
+        results.append({
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "snippet": r.get("snippet", ""),
+        })
+
+    if results:
+        summary_lines = [f"Web search results for: {query}\n"]
+        for i, r in enumerate(results, 1):
+            summary_lines.append(f"{i}. {r['title']}")
+            if r["snippet"]:
+                summary_lines.append(f"   {r['snippet']}")
+            if r["url"]:
+                summary_lines.append(f"   Source: {r['url']}")
+        answer = "\n".join(summary_lines)
+    else:
+        answer = f"No web search results found for: {query}"
+
+    result = {
+        "query": query,
+        "answer": answer,
+        "results": results,
+        "search_performed": True,
+    }
+    if workflow_id:
+        result["_trace"] = {"workflow_id": workflow_id, "session_id": session_id, "user_id": user_id}
+    return result
+
+
+async def answer_question(parameters: Dict[str, Any], workflow_id: str = None, session_id: str = None, user_id: str = None) -> Dict[str, Any]:
     """Answer a question using LLM, potentially with web search"""
     question = parameters.get("question")
     if not question:
@@ -306,7 +411,7 @@ async def answer_question(parameters: Dict[str, Any]) -> Dict[str, Any]:
     
     if needs_search:
         print(f"      💡 Query requires fresh data. Initiating web search...")
-        search_context = await perform_web_research(question)
+        search_context = await perform_web_research(question, workflow_id=workflow_id, session_id=session_id, user_id=user_id)
     
     # Combine contexts
     full_context = f"{context}\n{search_context}" if context else search_context
@@ -345,7 +450,7 @@ async def answer_question(parameters: Dict[str, Any]) -> Dict[str, Any]:
     
     answer = response['output']['message']['content'][0]['text']
     
-    return {
+    result = {
         "question": question,
         "answer": answer,
         "search_performed": needs_search,
@@ -354,9 +459,12 @@ async def answer_question(parameters: Dict[str, Any]) -> Dict[str, Any]:
             "output_tokens": response['usage'].get('outputTokens', 0)
         }
     }
+    if workflow_id:
+        result["_trace"] = {"workflow_id": workflow_id, "session_id": session_id, "user_id": user_id}
+    return result
 
 
-async def generate_report(parameters: Dict[str, Any]) -> Dict[str, Any]:
+async def generate_report(parameters: Dict[str, Any], workflow_id: str = None, session_id: str = None, user_id: str = None) -> Dict[str, Any]:
     """
     Generate a detailed report on the given topic.
     Uses web search if the topic may require up-to-date information.
@@ -387,7 +495,7 @@ async def generate_report(parameters: Dict[str, Any]) -> Dict[str, Any]:
     search_context = ""
     if needs_search:
         print(f"      💡 Topic requires fresh data. Initiating web search...")
-        search_context = await perform_web_research(topic)
+        search_context = await perform_web_research(topic, workflow_id=workflow_id, session_id=session_id, user_id=user_id)
 
     # Build prompt, incorporating any injected data and search context
     supplementary = ""
@@ -417,7 +525,7 @@ Make it detailed and well-researched.{' Use the web search results and previous 
 
     report = response['output']['message']['content'][0]['text']
 
-    return {
+    result = {
         "topic": topic,
         "report": report,
         "focus_area": aspects_str,
@@ -427,9 +535,12 @@ Make it detailed and well-researched.{' Use the web search results and previous 
             "output_tokens": response['usage'].get('outputTokens', 0)
         }
     }
+    if workflow_id:
+        result["_trace"] = {"workflow_id": workflow_id, "session_id": session_id, "user_id": user_id}
+    return result
 
 
-async def compare_concepts(parameters: Dict[str, Any]) -> Dict[str, Any]:
+async def compare_concepts(parameters: Dict[str, Any], workflow_id: str = None, session_id: str = None, user_id: str = None) -> Dict[str, Any]:
     """Compare and contrast concepts"""
     concept_a = parameters.get("concept_a")
     concept_b = parameters.get("concept_b")
@@ -456,7 +567,7 @@ Be thorough and objective."""
     
     comparison = response['output']['message']['content'][0]['text']
     
-    return {
+    result = {
         "concept_a": concept_a,
         "concept_b": concept_b,
         "comparison": comparison,
@@ -465,6 +576,9 @@ Be thorough and objective."""
             "output_tokens": response['usage'].get('outputTokens', 0)
         }
     }
+    if workflow_id:
+        result["_trace"] = {"workflow_id": workflow_id, "session_id": session_id, "user_id": user_id}
+    return result
 
 
 if __name__ == "__main__":

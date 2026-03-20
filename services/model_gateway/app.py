@@ -477,7 +477,9 @@ async def complete(
         fallbacks=[m.model_id for m in selection.fallbacks],
         estimated_cost_per_1k=selection.estimated_cost_usd_per_1k,
         workflow_id=body.workflow_id,
+        session_id=body.session_id,
         user_id=body.user_id,
+        cost_tier=body.cost_tier,
     )
 
     # ── 2. Build internal request ──────────────────────────────────────
@@ -609,7 +611,9 @@ async def complete_stream(
         reason=selection.selection_reason,
         fallbacks=[m.model_id for m in selection.fallbacks],
         workflow_id=body.workflow_id,
+        session_id=body.session_id,
         user_id=body.user_id,
+        cost_tier=body.cost_tier,
     )
 
     internal_req = _build_internal_request(

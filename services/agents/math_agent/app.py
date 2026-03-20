@@ -146,16 +146,23 @@ async def unregister_from_registry():
             print(f"✗ Failed to unregister: {e}")
 
 
-async def call_mcp_gateway(server_name: str, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+async def call_mcp_gateway(server_name: str, tool_name: str, arguments: Dict[str, Any], workflow_id: str = None, session_id: str = None, user_id: str = None) -> Dict[str, Any]:
     """Call MCP Gateway to execute tool"""
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
+            body: Dict[str, Any] = {
+                "tool_name": tool_name,
+                "parameters": arguments,
+            }
+            if workflow_id:
+                body["workflow_id"] = workflow_id
+            if session_id:
+                body["session_id"] = session_id
+            if user_id:
+                body["user_id"] = user_id
             response = await client.post(
                 f"{MCP_GATEWAY_URL}/api/gateway/execute",
-                json={
-                    "tool_name": tool_name,
-                    "parameters": arguments
-                }
+                json=body,
             )
             response.raise_for_status()
             data = response.json()
@@ -201,10 +208,14 @@ async def execute_task(task: TaskRequest) -> TaskResponse:
         # AUDIT: Log task execution with propagated identity
         context = task.context or {}
         user_identity = context.get("user_identity", {"user_id": "unknown", "role": "unknown"})
-        user_id = user_identity.get("user_id")
+        user_id = user_identity.get("user_id") or context.get("user_id")
+
+        # Trace IDs for end-to-end traceability
+        workflow_id = context.get("workflow_id")
+        session_id = context.get("session_id")
         
         audit_logger.log_event(
-            workflow_id=context.get("workflow_id", "direct_call"),
+            workflow_id=workflow_id or "direct_call",
             user_id=user_id,
             event_type="AGENT_EXECUTION",
             details={
@@ -220,13 +231,13 @@ async def execute_task(task: TaskRequest) -> TaskResponse:
             parameters = task.parameters
         
         if capability == "calculate":
-            result = await handle_calculate(parameters)
+            result = await handle_calculate(parameters, workflow_id=workflow_id, session_id=session_id, user_id=user_id)
         elif capability == "advanced_math":
-            result = await handle_advanced_math(parameters)
+            result = await handle_advanced_math(parameters, workflow_id=workflow_id, session_id=session_id, user_id=user_id)
         elif capability == "solve_equation":
-            result = await handle_solve_equation(parameters)
+            result = await handle_solve_equation(parameters, workflow_id=workflow_id, session_id=session_id, user_id=user_id)
         elif capability == "statistics":
-            result = await handle_statistics(parameters)
+            result = await handle_statistics(parameters, workflow_id=workflow_id, session_id=session_id, user_id=user_id)
         else:
             return TaskResponse(
                 task_id=task.task_id,
@@ -250,7 +261,7 @@ async def execute_task(task: TaskRequest) -> TaskResponse:
         )
 
 
-async def handle_calculate(params: Dict[str, Any]) -> Dict[str, Any]:
+async def handle_calculate(params: Dict[str, Any], workflow_id: str = None, session_id: str = None, user_id: str = None) -> Dict[str, Any]:
     """Handle basic calculations using MCP Gateway"""
     # Create interaction helper
     helper = AgentInteractionHelper(params)
@@ -326,19 +337,17 @@ async def handle_calculate(params: Dict[str, Any]) -> Dict[str, Any]:
     result = await call_mcp_gateway(
         server_name="calculator",
         tool_name=tool_map[operation],
-        arguments={"a": float(a), "b": float(b)}
+        arguments={"a": float(a), "b": float(b)},
+        workflow_id=workflow_id, session_id=session_id, user_id=user_id,
     )
     
-    return {
-        "operation": operation,
-        "a": a,
-        "b": b,
-        "result": result.get("result"),
-        "mcp_response": result
-    }
+    ret = {"operation": operation, "a": a, "b": b, "result": result.get("result"), "mcp_response": result}
+    if workflow_id:
+        ret["_trace"] = {"workflow_id": workflow_id, "session_id": session_id, "user_id": user_id}
+    return ret
 
 
-async def handle_advanced_math(params: Dict[str, Any]) -> Dict[str, Any]:
+async def handle_advanced_math(params: Dict[str, Any], workflow_id: str = None, session_id: str = None, user_id: str = None) -> Dict[str, Any]:
     """Handle advanced math operations using MCP Gateway"""
     operation = params.get("operation")
     value = params.get("value")
@@ -381,18 +390,17 @@ async def handle_advanced_math(params: Dict[str, Any]) -> Dict[str, Any]:
     result = await call_mcp_gateway(
         server_name="calculator",
         tool_name=tool_name,
-        arguments=arguments
+        arguments=arguments,
+        workflow_id=workflow_id, session_id=session_id, user_id=user_id,
     )
     
-    return {
-        "operation": operation,
-        "input": params,
-        "result": result.get("result"),
-        "mcp_response": result
-    }
+    ret = {"operation": operation, "input": params, "result": result.get("result"), "mcp_response": result}
+    if workflow_id:
+        ret["_trace"] = {"workflow_id": workflow_id, "session_id": session_id, "user_id": user_id}
+    return ret
 
 
-async def handle_solve_equation(params: Dict[str, Any]) -> Dict[str, Any]:
+async def handle_solve_equation(params: Dict[str, Any], workflow_id: str = None, session_id: str = None, user_id: str = None) -> Dict[str, Any]:
     """Handle equation solving using MCP Gateway"""
     equation = params.get("equation")
     
@@ -402,17 +410,17 @@ async def handle_solve_equation(params: Dict[str, Any]) -> Dict[str, Any]:
     result = await call_mcp_gateway(
         server_name="calculator",
         tool_name="solve_equation",
-        arguments={"equation": equation}
+        arguments={"equation": equation},
+        workflow_id=workflow_id, session_id=session_id, user_id=user_id,
     )
     
-    return {
-        "equation": equation,
-        "solution": result.get("result"),
-        "mcp_response": result
-    }
+    ret = {"equation": equation, "solution": result.get("result"), "mcp_response": result}
+    if workflow_id:
+        ret["_trace"] = {"workflow_id": workflow_id, "session_id": session_id, "user_id": user_id}
+    return ret
 
 
-async def handle_statistics(params: Dict[str, Any]) -> Dict[str, Any]:
+async def handle_statistics(params: Dict[str, Any], workflow_id: str = None, session_id: str = None, user_id: str = None) -> Dict[str, Any]:
     """Handle statistical calculations using MCP Gateway"""
     operation = params.get("operation")
     numbers = params.get("numbers")
@@ -436,15 +444,14 @@ async def handle_statistics(params: Dict[str, Any]) -> Dict[str, Any]:
     result = await call_mcp_gateway(
         server_name="calculator",
         tool_name=tool_map[operation],
-        arguments={"numbers": [float(n) for n in numbers]}
+        arguments={"numbers": [float(n) for n in numbers]},
+        workflow_id=workflow_id, session_id=session_id, user_id=user_id,
     )
     
-    return {
-        "operation": operation,
-        "numbers": numbers,
-        "result": result.get("result"),
-        "mcp_response": result
-    }
+    ret = {"operation": operation, "numbers": numbers, "result": result.get("result"), "mcp_response": result}
+    if workflow_id:
+        ret["_trace"] = {"workflow_id": workflow_id, "session_id": session_id, "user_id": user_id}
+    return ret
 
 
 if __name__ == "__main__":

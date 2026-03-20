@@ -215,16 +215,22 @@ class ModelSelector:
                 max_context_needed=context_tokens_needed,
             )
 
-        # Fall back to any available model if still nothing
+        # Fall back to any available model within enabled providers if still nothing
         if not candidates:
-            candidates = self._registry.best_models_for_task(task=TaskType.GENERAL)
+            candidates = self._registry.best_models_for_task(
+                task=TaskType.GENERAL,
+                providers=providers_filter if providers_filter else None,
+            )
 
         # Filter out providers with open circuit
         candidates = [m for m in candidates if m.provider not in unhealthy]
 
         if not candidates:
-            # Last resort: any non-deprecated model
+            # Last resort: any non-deprecated model — still respect enabled providers
             candidates = self._registry.all_models()
+            if providers_filter:
+                _pf_set = set(providers_filter)
+                candidates = [m for m in candidates if m.provider in _pf_set]
             candidates = [m for m in candidates if m.provider not in unhealthy]
 
         if not candidates:
