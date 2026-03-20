@@ -117,6 +117,34 @@ services:
       start_period: 20s
 
   # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Model Gateway — multi-provider LLM facade (port 8400)
+  # Provides: intelligent model selection, transparent fallback,
+  # circuit breakers, and full audit trail across all LLM providers.
+  # ---------------------------------------------------------------------------
+  model-gateway:
+    build:
+      context: .
+      dockerfile: services/model_gateway/Dockerfile
+    env_file: services/model_gateway/.env
+    ports:
+      - "8400:8400"
+    volumes:
+      - ${HOME}/.aws:/root/.aws:ro
+      - model-gateway-audit:/app/audit_logs
+    depends_on:
+      registry:
+        condition: service_healthy
+    networks:
+      - a2a-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8400/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
   # MCP Servers (after MCP Registry)
   # ---------------------------------------------------------------------------
 
@@ -318,4 +346,6 @@ volumes:
   redis-data:
     driver: local
   qdrant-data:
+    driver: local
+  model-gateway-audit:
     driver: local

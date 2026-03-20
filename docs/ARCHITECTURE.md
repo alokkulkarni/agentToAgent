@@ -4,7 +4,7 @@
 
 The Agent-to-Agent (A2A) framework is a distributed, microservices-based system designed for autonomous multi-agent collaboration. It leverages **AWS Bedrock (Claude 3.5 Sonnet)** for LLM capabilities and the **Model Context Protocol (MCP)** for standardized tool integration. The system is designed with enterprise-grade security, auditability, high-availability, and context preservation at its core.
 
-**Current version**: 3.0 — adds HA multi-replica orchestrator, distributed state via Redis, Vector Memory with 10+ backends, WebSocket real-time interface, pluggable database backends, mustache inter-step template resolution, and a full Conversation + Thought Trail persistence layer.
+**Current version**: 3.0 — adds HA multi-replica orchestrator, distributed state via Redis, Vector Memory with 10+ backends, WebSocket real-time interface, pluggable database backends, mustache inter-step template resolution, a full Conversation + Thought Trail persistence layer, and a multi-provider Model Gateway with intelligent model selection and transparent fallback.
 
 ### High-Level Architecture
 
@@ -44,6 +44,14 @@ The Agent-to-Agent (A2A) framework is a distributed, microservices-based system 
       |   AGENT MESH    |
       | (Research, Code,|
       |  Data, Math...) |
+      +--------+--------+
+               |
+      +--------+--------+
+      | MODEL GATEWAY   |
+      | (Port 8400)     |
+      | Anthropic/      |
+      | Bedrock/Gemini/ |
+      | OpenAI (+53 mdl)|
       +--------+--------+
                |
    +-----------+-------------------+
@@ -137,6 +145,103 @@ Central catalog of all available MCP tools.
 - **Tool Registration**: MCP servers register their tools and capabilities on startup.
 - **Auth Schema**: Each tool can declare its authentication requirements via `ToolAuthSchema` (required scopes, audience, token endpoint).
 - **Auth Endpoint**: `GET /api/mcp/tools/{tool_name}/auth` — queried by the Gateway before executing a tool.
+
+### Model Gateway (Port 8400)
+Provider-agnostic LLM facade that decouples the orchestrator and all agents from specific LLM providers.
+
+#### Architecture
+
+```ascii
+  Orchestrator / Any Agent
+          |
+          | POST /v1/complete   (or /v1/complete/stream for SSE)
+          v
+  +-------+----------------------------------------------------------+
+  |                    MODEL GATEWAY  (Port 8400)                    |
+  |                                                                  |
+  |   ┌──────────────────────────────────────┐                      |
+  |   │          MODEL SELECTOR              │                      |
+  |   │  Task auto-detection (regex)         │                      |
+  |   │  Tier: economy/balanced/premium/     │                      |
+  |   │        reasoning                     │                      |
+  |   │  Capability filter (vision/tools/…)  │                      |
+  |   │  Provider preference + cost opt.     │                      |
+  |   └───────────────┬──────────────────────┘                      |
+  |                   │                                              |
+  |   ┌───────────────v──────────────────────┐                      |
+  |   │          FALLBACK MANAGER            │                      |
+  |   │  Circuit breakers (per provider)     │                      |
+  |   │  CLOSED → OPEN (3 failures)          │                      |
+  |   │  OPEN → HALF_OPEN (60s timeout)      │                      |
+  |   │  HALF_OPEN → CLOSED (2 successes)    │                      |
+  |   │  Transparent fallback chain          │                      |
+  |   └───┬───────┬──────────┬──────────┬───┘                      |
+  |       │       │          │          │                           |
+  |       v       v          v          v                           |
+  |  +----+--+ +--+---+ +----+---+ +----+---+                      |
+  |  |ANTHROP| |BEDROCK| | GEMINI | | OPENAI |                      |
+  |  |Claude | |Claude | |Gemini  | |GPT-4o  |                      |
+  |  |Opus   | |Nova   | |2.0 Pro | |o3      |                      |
+  |  |Sonnet | |Llama  | |1.5 Pro | |GPT-4T  |                      |
+  |  |Haiku  | |Mistral| |Flash   | |o1/mini |                      |
+  |  +-------+ +-------+ +--------+ +--------+                      |
+  |                                                                  |
+  |   ┌──────────────────────────────────────┐                      |
+  |   │       GATEWAY AUDIT LOGGER           │                      |
+  |   │  Rotating JSONL + SHA-256 chain      │                      |
+  |   │  Logs: selection, request, response, │                      |
+  |   │  fallbacks, health changes, errors   │                      |
+  |   └──────────────────────────────────────┘                      |
+  +------------------------------------------------------------------+
+```
+
+#### Providers and Models (53 total)
+
+| Provider | Models |
+|----------|--------|
+| **Anthropic** (direct) | claude-opus-4-6, claude-sonnet-4-6, claude-opus-4-5, claude-sonnet-4-5, claude-3-7-sonnet-20250219, claude-3-5-sonnet-20241022, claude-3-5-haiku-20241022, claude-3-opus-20240229 *(deprecated)*, claude-3-haiku-20240307 *(deprecated)* |
+| **AWS Bedrock** (Converse API) | Claude Opus 4.6/Sonnet 4.6/Opus 4.5/Sonnet 4.5/3.7 Sonnet/3.5 Sonnet v2/3.5 Haiku/3 Opus; Amazon Nova Premier/Pro/Lite/Micro; Meta Llama 4 Maverick/Scout, Llama 3.3 70B, Llama 3.2 90B/11B, Llama 3 70B/8B; DeepSeek R1; Mistral Large 2/Mixtral 8x7B; Cohere Command R+/R |
+| **Google Gemini** | gemini-3.1-pro-preview, gemini-3-flash-preview, gemini-2.5-pro, gemini-2.5-flash, gemini-2.5-flash-lite, gemini-1.5-pro-002, gemini-1.5-flash-002, gemini-1.5-flash-8b, gemini-2.0-flash *(deprecated)*, gemini-1.0-pro *(deprecated)* |
+| **OpenAI** | o4-mini, o3, o3-mini, o1, o1-mini, gpt-4.5-preview, gpt-4o, gpt-4o-mini, gpt-4-turbo, gpt-3.5-turbo |
+
+#### Key Features
+- **Intelligent model selection**: Automatic task-type detection (coding, reasoning, math, creative, summarization, classification, extraction, vision, long-context, fast) → best-fit model chosen per request.
+- **Cost tiers**: `economy` / `balanced` / `premium` / `reasoning` — configurable per request or globally.
+- **Transparent fallback**: If the primary provider fails, the next best cross-provider model is tried automatically with no change to the calling API.
+- **Circuit breakers**: Per-provider state machines prevent cascading failures. Circuits auto-recover.
+- **Audit trail**: Every selection, inference call, response, fallback, and health change is logged in a tamper-evident WORM JSONL log with SHA-256 chain hashing.
+- **Background health polling**: All 4 providers are probed every 30 s; unhealthy providers are excluded from selection.
+
+#### API Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/v1/complete` | Main inference (auto-select + fallback) |
+| `POST` | `/v1/complete/stream` | Streaming SSE inference |
+| `GET` | `/v1/models` | List all 34 registered models |
+| `GET` | `/v1/models/{id}` | Model metadata + capabilities |
+| `GET` | `/v1/select` | Preview which model would be selected (no inference) |
+| `GET` | `/health` | Liveness + per-provider health summary |
+| `GET` | `/v1/admin/circuit-breakers` | Circuit breaker states |
+| `POST` | `/v1/admin/circuit-breakers/{provider}/reset` | Manually reset a breaker |
+| `GET` | `/v1/admin/fallback-events` | Recent fallback history |
+| `GET` | `/v1/admin/audit-log` | Recent audit entries |
+
+#### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MODEL_GATEWAY_PORT` | `8400` | Service port |
+| `ANTHROPIC_API_KEY` | — | Anthropic direct API key |
+| `AWS_DEFAULT_REGION` | `us-east-1` | AWS region for Bedrock |
+| `GOOGLE_API_KEY` | — | Google AI Studio API key |
+| `OPENAI_API_KEY` | — | OpenAI API key |
+| `GATEWAY_DEFAULT_TIER` | `balanced` | Default model tier |
+| `GATEWAY_COST_OPTIMIZE` | `true` | Prefer cheaper equally-capable models |
+| `GATEWAY_PREFERRED_PROVIDERS` | — | Comma-separated preferred providers |
+| `GATEWAY_CB_FAILURE_THRESHOLD` | `3` | Failures before opening circuit |
+| `GATEWAY_CB_HALF_OPEN_AFTER_SEC` | `60` | Seconds before recovery probe |
+| `GATEWAY_AUDIT_REDACT_CONTENT` | `true` | Suppress raw content from audit log |
 
 ---
 
