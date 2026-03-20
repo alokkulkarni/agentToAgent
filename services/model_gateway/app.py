@@ -72,6 +72,16 @@ from health.provider_health import (
 )
 
 # ---------------------------------------------------------------------------
+# Provider class registry — used for lazy / selective instantiation
+# ---------------------------------------------------------------------------
+_PROVIDER_CLASSES: Dict[ProviderType, Any] = {
+    ProviderType.ANTHROPIC: AnthropicProvider,
+    ProviderType.BEDROCK: BedrockProvider,
+    ProviderType.GEMINI: GeminiProvider,
+    ProviderType.OPENAI: OpenAIProvider,
+}
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -108,32 +118,56 @@ async def lifespan(app: FastAPI):
 
     logger.info("Model Gateway starting up…")
 
-    # Instantiate providers
-    _providers = {
-        ProviderType.ANTHROPIC: AnthropicProvider(),
-        ProviderType.BEDROCK: BedrockProvider(),
-        ProviderType.GEMINI: GeminiProvider(),
-        ProviderType.OPENAI: OpenAIProvider(),
-    }
+    # ── 1. Initialise provider config store FIRST so we know which providers
+    #       are enabled before touching any SDK or credentials.
+    config_store = get_provider_config_store()
+    cfg = config_store.get()
+    enabled = set(cfg.enabled_providers)  # ProviderType set
 
-    # Routing & registry
+    logger.info(
+        "Provider config loaded. Enabled providers: %s",
+        [p.value for p in cfg.enabled_providers] or "(all — no restriction set)",
+    )
+
+    # ── 2. Instantiate ONLY the enabled providers.
+    #       Providers with missing credentials log a warning and mark
+    #       themselves unhealthy, but never raise at __init__ time.
+    _providers = {}
+    for pt in ProviderType:
+        cls = _PROVIDER_CLASSES.get(pt)
+        if cls is None:
+            continue  # shouldn't happen; guard against missing mapping
+        if not enabled or pt in enabled:
+            # "not enabled" means no restriction is configured — instantiate all
+            try:
+                _providers[pt] = cls()
+            except Exception as exc:
+                logger.error(
+                    "Failed to instantiate provider '%s': %s — it will be unavailable.",
+                    pt.value, exc,
+                )
+        else:
+            logger.info(
+                "Provider '%s' is not in the enabled list — skipping instantiation.",
+                pt.value,
+            )
+
+    # ── 3. Routing & registry
     _registry = get_model_registry()
     _selector = get_model_selector()
     _fallback_manager = get_fallback_manager()
     _audit = get_gateway_audit_logger()
 
-    # Ensure provider config store is initialised (loads from disk or env)
-    get_provider_config_store()
-
-    # Health monitor
+    # ── 4. Health monitor (polls only instantiated providers)
     _health_monitor = ProviderHealthMonitor(_providers, _fallback_manager)
     set_health_monitor(_health_monitor)
     await _health_monitor.start()
 
     logger.info(
-        "Model Gateway ready — %d models registered across %d providers.",
+        "Model Gateway ready — %d models registered, %d/%d providers active.",
         len(_registry.all_models()),
         len(_providers),
+        len(list(ProviderType)),
     )
     yield
 
@@ -174,6 +208,24 @@ def get_providers() -> Dict[ProviderType, Any]:
     if not _providers:
         raise HTTPException(503, "Model Gateway not yet initialised.")
     return _providers
+
+
+def _instantiate_provider(pt: ProviderType) -> Any:
+    """
+    Lazily instantiate a provider that was not enabled at startup.
+    Adds it to the live _providers dict so subsequent requests can use it.
+    The health monitor will pick it up on the next polling cycle because
+    it holds a reference to the same dict.
+    """
+    if pt in _providers:
+        return _providers[pt]
+    cls = _PROVIDER_CLASSES.get(pt)
+    if cls is None:
+        raise ValueError(f"No provider class registered for {pt.value}")
+    instance = cls()
+    _providers[pt] = instance
+    logger.info("Provider '%s' lazy-instantiated after runtime enable.", pt.value)
+    return instance
 
 def get_selector() -> ModelSelector:
     return _selector or get_model_selector()
@@ -872,6 +924,21 @@ async def patch_single_provider(
 
     store = get_provider_config_store()
     new_cfg = await store.update_provider(pt, patch_dict, updated_by="api")
+
+    # If the provider was just enabled and hasn't been instantiated yet, do so now.
+    if patch_dict.get("enabled") is True and pt not in _providers:
+        try:
+            _instantiate_provider(pt)
+            logger.info(
+                "Provider '%s' enabled at runtime — instance created.", pt.value
+            )
+        except Exception as exc:
+            logger.warning(
+                "Provider '%s' enabled but could not be instantiated: %s "
+                "(check credentials / connectivity).",
+                pt.value, exc,
+            )
+
     return _config_to_response(new_cfg)
 
 

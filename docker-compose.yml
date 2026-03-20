@@ -129,6 +129,12 @@ services:
     env_file: services/model_gateway/.env
     ports:
       - "8400:8400"
+    environment:
+      # Tell boto3 explicitly where to find credentials — the container runs as
+      # a non-root user (UID 1001) so ~/.aws resolves to the wrong path unless
+      # we override these env vars to point at the mounted /root/.aws directory.
+      - AWS_SHARED_CREDENTIALS_FILE=/root/.aws/credentials
+      - AWS_CONFIG_FILE=/root/.aws/config
     volumes:
       - ${HOME}/.aws:/root/.aws:ro
       - model-gateway-audit:/app/audit_logs
