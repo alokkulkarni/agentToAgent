@@ -4,7 +4,8 @@ A generic, extensible framework for autonomous multi-agent collaboration using *
 
 ## 🌟 Key Features
 
-*   **🤖 Multi-Agent Orchestration**: Intelligent planning and task delegation using Claude 3.5 Sonnet.
+*   **🤖 Multi-Agent Orchestration**: Intelligent planning and task delegation via a dedicated **Model Gateway** supporting multiple LLM providers and AWS regions. Uses Amazon Nova Pro (default) with automatic fallback and circuit-breaker protection.
+*   **🌐 Real-Time Web Search**: The Research Agent includes a dedicated `search_web` capability that routes live/current-data queries (time, weather, prices, news) to the MCP web-search server — distinct from the `answer_question` LLM-knowledge path.
 *   **🔌 MCP Integration**: Standardized tool integration via the Model Context Protocol.
 *   **🗣️ Interactive Human-in-the-Loop**: First-class support for pausing workflows mid-execution to request user guidance (text, choices, confirmations) and resuming exactly where the workflow left off.
 *   **💾 Context Preservation**: Session-scoped conversation history and thought trails persist across multiple workflows. Supports semantic recall via a pluggable **Vector Memory Store**.
@@ -56,6 +57,13 @@ A generic, extensible framework for autonomous multi-agent collaboration using *
     |   MCP GATEWAY    |<------------->|   MCP REGISTRY    |
     |   (Port 8300)    |  Fetch/Verify | (Tool Auth Reqs)  |
     +--------+---------+               +-------------------+
+
+    LLM Routing (Orchestrator → Model Gateway → Bedrock):
+    +-------------------------------------------+
+    |          MODEL GATEWAY (Port 8400)        |
+    | Provider routing | Circuit breaker        |
+    | Amazon Nova / Claude | Multi-region        |
+    +-------------------------------------------+
              |
              | (Tool-Scoped Token via OBO)
              v
@@ -95,6 +103,10 @@ cp services/orchestrator/.env.example services/orchestrator/.env
 # Edit .env and add your AWS credentials / identity provider settings
 ```
 
+> **AWS Credentials**: Docker Compose mounts `~/.aws` into containers at `/app/.aws` (not `/root/.aws`).  
+> The env vars `AWS_SHARED_CREDENTIALS_FILE=/app/.aws/credentials` and `AWS_CONFIG_FILE=/app/.aws/config`  
+> are set automatically — no manual credential injection needed.
+
 ### 2. Start All Services
 ```bash
 # Start everything via Docker Compose (Registry, Redis, Qdrant, Orchestrator,
@@ -126,7 +138,36 @@ python examples/websocket_interactive_workflow.py
 
 ---
 
-## 🗣️ Human-in-the-Loop Workflows
+## � Real-Time Web Search Routing
+
+The orchestrator planner automatically distinguishes between queries that need **live data** and those that can be answered from **LLM knowledge**:
+
+| Query type | Capability selected | Agent |
+|---|---|---|
+| Current time / today's date | `search_web` | ResearchAgent |
+| Live prices, weather, news | `search_web` | ResearchAgent |
+| Concept explanation, history | `answer_question` | ResearchAgent |
+| Arithmetic / math | `calculate` | MathAgent |
+
+The planner enforces this via a hard routing rule: *any query that asks for real-time or live information must use `search_web`, not `answer_question`*.
+
+### Replacing the Mock Web Search with a Real API
+
+The default web search MCP server (`services/mcp_servers/web_search/app.py`) returns placeholder results. To integrate a real search engine:
+
+```bash
+# services/mcp_servers/web_search/.env
+SEARCH_PROVIDER=brave          # brave | google | bing
+BRAVE_API_KEY=your-key-here    # for Brave Search
+# GOOGLE_API_KEY / GOOGLE_CSE_ID for Google Custom Search
+# BING_API_KEY for Bing
+```
+
+Once set, the `search_web` tool in `app.py` will call the real API instead of returning mock results.
+
+---
+
+## �🗣️ Human-in-the-Loop Workflows
 
 The framework treats human interaction as a first-class concern. At any point during execution, an agent can pause the workflow and ask the user for guidance.
 
@@ -324,11 +365,11 @@ VECTOR_MEMORY_SCORE_THRESHOLD=0.3
 | Agent | Port | Capabilities |
 |---|---|---|
 | Code Analyzer | 8001 | `analyze_python_code`, `explain_code`, `suggest_improvements`, `detect_bugs` |
-| Data Processor | 8002 | data analysis, transformation, statistics |
-| Research Agent | 8003 | `answer_question`, `research`, `generate_report` (via MCP web search) |
+| Data Processor | 8002 | `transform_data`, `analyze_data`, `summarize_data` |
+| Research Agent | 8003 | `search_web` *(real-time/live data)*, `answer_question` *(LLM knowledge)*, `generate_report`, `compare_concepts` |
 | Task Executor | 8004 | `execute_command`, `file_operations`, `wait_task` |
 | Observer | 8005 | `system_monitoring`, `event_logging`, `metrics_reporting`, `agent_statistics` |
-| Math Agent | 8006 | `calculate`, `solve_equation`, `unit_convert`, `answer_question` (via MCP calculator) |
+| Math Agent | 8006 | `calculate`, `advanced_math`, `solve_equation`, `statistics` |
 
 ### MCP Servers (The "Hands")
 
@@ -336,7 +377,7 @@ VECTOR_MEMORY_SCORE_THRESHOLD=0.3
 |---|---|---|
 | File Ops | 8210 | `read_file`, `write_file`, `list_files` |
 | Database | 8211 | `query_database`, `execute_sql` |
-| Web Search | 8212 | `search`, `get_content` |
+| Web Search | 8212 | `search_web` — returns live search results (mock by default; swap with Brave/Google API) |
 | Calculator | 8213 | `calculate` |
 
 ### Infrastructure Services
@@ -346,8 +387,34 @@ VECTOR_MEMORY_SCORE_THRESHOLD=0.3
 | Agent Registry | 8000 | Agent discovery, heartbeat, health |
 | MCP Registry | 8200 | Tool catalog, auth schemas |
 | MCP Gateway | 8300 | JWT validation, OBO exchange, tool routing |
+| Model Gateway | 8400 | LLM provider routing, circuit breaker, multi-region Bedrock support |
 | Redis | 6379 | HA shared state, pub/sub, session store |
 | Qdrant | 6333 | Vector memory store |
+
+### Model Gateway (Port 8400)
+
+The Model Gateway decouples LLM provider selection from agent code. The orchestrator sends all planning requests through the gateway, which handles:
+
+*   **Provider routing** — Bedrock (default), with hookpoints for Azure OpenAI, OpenAI, and other providers.
+*   **Circuit breaker** — Opens automatically after repeated `ValidationException` / 5xx errors; resets on recovery.
+*   **Health probe** — Periodic lightweight inference call (configurable model) to gate the circuit state.
+*   **Multi-region awareness** — Amazon Nova models are available in all AWS regions. Claude models require `us-east-1`; the gateway enforces this at routing time.
+
+#### Key Environment Variables
+
+```bash
+# services/model_gateway/.env  (or docker-compose environment)
+BEDROCK_REGION=eu-west-2                         # AWS region for Bedrock calls
+BEDROCK_HEALTH_PROBE_MODEL=amazon.nova-micro-v1:0  # Lightweight model for health checks
+
+# services/orchestrator/.env
+LLM_PROVIDER=model_gateway                        # Route all LLM calls through the gateway
+MODEL_GATEWAY_URL=http://model-gateway:8400
+# Use a Nova model when deploying in non-us-east-1 regions (Claude unavailable there)
+MODEL_GATEWAY_PREFERRED_MODEL=amazon.nova-pro-v1:0
+```
+
+> **Region note**: If you are running in `us-east-1` you may set `MODEL_GATEWAY_PREFERRED_MODEL=anthropic.claude-3-5-sonnet-20241022-v2:0`. For any other region use an Amazon Nova model (e.g. `amazon.nova-pro-v1:0`).
 
 ---
 
@@ -373,5 +440,13 @@ python scripts/test_distributed_system.py
 
 ---
 
-**Version**: 3.0
-**Last Updated**: 2026-03-16
+**Version**: 3.1
+**Last Updated**: 2026-03-20
+
+### Recent Changes (v3.1)
+- **Model Gateway** (port 8400): New LLM routing service with circuit breaker, health probe, and multi-region Bedrock support.
+- **Amazon Nova model support**: `MODEL_GATEWAY_PREFERRED_MODEL=amazon.nova-pro-v1:0` enables deployment in all AWS regions, not just `us-east-1`.
+- **`search_web` capability** on ResearchAgent: Dedicated routing path for real-time/live queries via the MCP web-search server.
+- **Smart planner routing rule**: Orchestrator planner enforces mandatory `search_web` selection for any time/date/live-data query.
+- **AWS credential mount fix**: Credentials now mounted to `/app/.aws` (previously `/root/.aws`, which was inaccessible to the container user).
+- **Health probe model fix**: Model Gateway health check uses `amazon.nova-micro-v1:0` (configurable via `BEDROCK_HEALTH_PROBE_MODEL`).
