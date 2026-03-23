@@ -2,128 +2,176 @@
 
 **Comprehensive Documentation Guide**
 
+Last Updated: 2026-03-23
+
 ---
 
 ## 📚 Main Documentation
 
 ### Essential Reading
 
-1. **[README.md](README.md)** - Start here!
-   - Project overview
-   - Quick start guides
-   - Key features
-   - Technology stack
+1. **[../README.md](../README.md)** — Start here!
+   - Project overview and quick start
+   - Key features (per service and overall)
+   - Architecture diagram (identity, security, Model Gateway, agent mesh)
+   - Model Gateway, Human-in-the-Loop, HA orchestrator, and Vector Memory descriptions
+   - Individual service details and API reference
+   - How to run (shell script and Docker Compose)
+   - Example workflows and use cases
 
-2. **[QUICK_START.md](QUICK_START.md)** - Quick Reference
-   - Fast deployment options
+2. **[QUICK_START.md](QUICK_START.md)** — Quick Reference
+   - Fast deployment options (shell scripts and Docker Compose)
    - Common commands
-   - Example workflows
-   - Troubleshooting basics
+   - Complete service endpoint table (including Model Gateway port 8400)
+   - Basic troubleshooting including Model Gateway health checks
 
-3. **[ARCHITECTURE.md](ARCHITECTURE.md)** - System Design
-   - High-level architecture
-   - Component details
-   - Service communication
-   - Data flow diagrams
+3. **[ARCHITECTURE.md](ARCHITECTURE.md)** — System Design
+   - High-level architecture diagram (identity layer, security layer, context layer)
+   - Component details and responsibilities for every service
+   - Model Gateway: provider routing, circuit breakers, model catalogue, audit
+   - Service communication flows
    - Port allocation
+   - Data flow walkthrough
    - MCP integration
+   - Workflow execution (parallel, sequential, retry, circuit breaker)
+   - HA orchestrator and distributed state via Redis
+   - Vector Memory architecture
+   - Scalability and performance
 
 ### Deployment Guides
 
-4. **[DOCKER_DEPLOYMENT.md](DOCKER_DEPLOYMENT.md)** - Docker Guide
-   - Docker Compose setup
-   - Container configuration
+4. **[DEPLOYMENT.md](DEPLOYMENT.md)** — Local / Docker Compose Setup
+   - Docker Compose configuration
+   - Container environment variables
    - Volume management
-   - Production deployment
 
-5. **[AWS_CREDENTIALS_GUIDE.md](AWS_CREDENTIALS_GUIDE.md)** - AWS Configuration
-   - Credential management
-   - Shell script vs Docker
+5. **[DEPLOYMENT_AWS.md](DEPLOYMENT_AWS.md)** — AWS Deployment
+   - ECS Fargate deployment
+   - EKS (Kubernetes) deployment
+   - EC2 setup
+   - IAM roles and Bedrock access
+
+6. **[DEPLOYMENT_AZURE.md](DEPLOYMENT_AZURE.md)** — Azure Deployment
+   - Azure Container Apps (ACA)
+   - AKS (Kubernetes) deployment
+   - Azure OpenAI integration with Model Gateway
+
+7. **[AWS_CREDENTIALS_GUIDE.md](AWS_CREDENTIALS_GUIDE.md)** — AWS Configuration
+   - Credential management options
+   - Shell script vs Docker credential handling (mount path `/app/.aws`)
    - Security best practices
-   - IAM role configuration
+   - IAM role configuration for Bedrock
 
-6. **[DEPLOYMENT_COMPARISON.md](DEPLOYMENT_COMPARISON.md)** - Deployment Methods
-   - Shell script vs Docker
-   - Pros and cons
-   - Use case recommendations
+8. **[ENTERPRISE_DEPLOYMENT.md](ENTERPRISE_DEPLOYMENT.md)** — Enterprise Guide
+   - HA orchestrator with Redis
+   - PostgreSQL backend
+   - Guardrails, PII Vault, and Audit Logging
+   - Identity provider integration
+
+9. **[IDENTITY_PROVIDER_SETUP.md](IDENTITY_PROVIDER_SETUP.md)** — Authentication
+   - Azure AD / Okta / Auth0 / Cognito / Keycloak setup
+   - JWT token validation
+   - RBAC and scope-based access control
+   - On-Behalf-Of (OBO) token exchange for MCP tools
 
 ### Testing & Development
 
-7. **[TESTING_GUIDE.md](TESTING_GUIDE.md)** - Testing Guide
-   - Test workflows
-   - API testing
-   - Integration tests
-   - Performance testing
+10. **[CURL_EXAMPLES.md](CURL_EXAMPLES.md)** — REST API Examples
+    - Workflow execution examples
+    - Registry and agent API calls
+    - Model Gateway inference examples (`/v1/complete`, `/v1/models`, `/v1/select`)
+    - Health-check commands
 
-8. **[CURL_EXAMPLES.md](CURL_EXAMPLES.md)** - API Examples
-   - Workflow execution
-   - Agent interactions
-   - Registry operations
+11. **[MCP_CURL_EXAMPLES.md](MCP_CURL_EXAMPLES.md)** — MCP Tool Examples
+    - Calculator operations via MCP Gateway
+    - Database query examples
+    - File operation examples
+    - Web search examples
 
-9. **[MCP_CURL_EXAMPLES.md](MCP_CURL_EXAMPLES.md)** - MCP Tool Examples
-   - Calculator operations
-   - Database queries
-   - File operations
+12. **[INTERACTIVE_WORKFLOW_EXAMPLES.md](INTERACTIVE_WORKFLOW_EXAMPLES.md)** — Human-in-the-Loop
+    - Pausing workflows for user input
+    - WebSocket interaction examples
+    - CLI chat usage
 
-### New Features
+13. **[COMPONENT_REFERENCE.md](COMPONENT_REFERENCE.md)** — Component Reference
+    - Per-service environment variable reference
+    - Configuration options
+    - Integration points
 
-10. **[ENHANCEMENTS_COMPLETE.md](ENHANCEMENTS_COMPLETE.md)** - Feature Guide
-    - Workflow persistence
-    - Retry mechanisms
-    - Parallel execution
-    - Implementation details
-    - Integration instructions
+### Architecture Supplements
+
+14. **[MULTI_STEP_INTERACTIONS.md](MULTI_STEP_INTERACTIONS.md)** — Multi-Step Flows
+    - Complex multi-agent workflow patterns
+    - Context enrichment and mustache template resolution
+
+15. **[README_INTERACTIVE_WORKFLOWS.md](README_INTERACTIVE_WORKFLOWS.md)** — Interactive Workflows
+    - Human-in-the-loop design patterns
+    - Workflow state machine
 
 ---
 
 ## 🗂️ Documentation by Topic
 
 ### Getting Started
-1. Read [README.md](README.md)
+1. Read [../README.md](../README.md)
 2. Follow [QUICK_START.md](QUICK_START.md)
-3. Choose deployment: [DOCKER_DEPLOYMENT.md](DOCKER_DEPLOYMENT.md)
+3. Choose deployment: [DEPLOYMENT.md](DEPLOYMENT.md) (local/Docker), [DEPLOYMENT_AWS.md](DEPLOYMENT_AWS.md), or [DEPLOYMENT_AZURE.md](DEPLOYMENT_AZURE.md)
 4. Configure AWS: [AWS_CREDENTIALS_GUIDE.md](AWS_CREDENTIALS_GUIDE.md)
 
 ### Understanding the System
 1. Architecture: [ARCHITECTURE.md](ARCHITECTURE.md)
-2. Components: [ARCHITECTURE.md#component-details](ARCHITECTURE.md#component-details)
-3. Data Flow: [ARCHITECTURE.md#data-flow](ARCHITECTURE.md#data-flow)
+2. Component details: [ARCHITECTURE.md#component-details](ARCHITECTURE.md#component-details)
+3. Model Gateway: [ARCHITECTURE.md#model-gateway-port-8400](ARCHITECTURE.md#model-gateway-port-8400)
+4. Data flow: [ARCHITECTURE.md#data-flow](ARCHITECTURE.md#data-flow)
+5. Service descriptions: [../README.md#service-architecture](../README.md#service-architecture)
 
 ### Deploying
-1. Shell Script: [QUICK_START.md#option-1](QUICK_START.md)
-2. Docker Compose: [DOCKER_DEPLOYMENT.md](DOCKER_DEPLOYMENT.md)
-3. Comparison: [DEPLOYMENT_COMPARISON.md](DEPLOYMENT_COMPARISON.md)
+1. Local shell scripts: [QUICK_START.md](QUICK_START.md)
+2. Docker Compose: [DEPLOYMENT.md](DEPLOYMENT.md)
+3. AWS (ECS/EKS): [DEPLOYMENT_AWS.md](DEPLOYMENT_AWS.md)
+4. Azure (ACA/AKS): [DEPLOYMENT_AZURE.md](DEPLOYMENT_AZURE.md)
+5. Enterprise HA: [ENTERPRISE_DEPLOYMENT.md](ENTERPRISE_DEPLOYMENT.md)
 
 ### Testing
-1. Basic Tests: [TESTING_GUIDE.md](TESTING_GUIDE.md)
-2. API Examples: [CURL_EXAMPLES.md](CURL_EXAMPLES.md)
-3. MCP Tools: [MCP_CURL_EXAMPLES.md](MCP_CURL_EXAMPLES.md)
+1. API examples: [CURL_EXAMPLES.md](CURL_EXAMPLES.md)
+2. MCP tool examples: [MCP_CURL_EXAMPLES.md](MCP_CURL_EXAMPLES.md)
+3. Interactive workflow tests: [INTERACTIVE_WORKFLOW_EXAMPLES.md](INTERACTIVE_WORKFLOW_EXAMPLES.md)
+
+### Model Gateway
+1. Architecture: [ARCHITECTURE.md#model-gateway-port-8400](ARCHITECTURE.md#model-gateway-port-8400)
+2. API examples: [CURL_EXAMPLES.md](CURL_EXAMPLES.md)
+3. Environment variables: [COMPONENT_REFERENCE.md](COMPONENT_REFERENCE.md)
+4. Source: `services/model_gateway/`
 
 ### Advanced Features
-1. Persistence: [ENHANCEMENTS_COMPLETE.md#workflow-persistence](ENHANCEMENTS_COMPLETE.md)
-2. Retry: [ENHANCEMENTS_COMPLETE.md#retry-mechanisms](ENHANCEMENTS_COMPLETE.md)
-3. Parallel: [ENHANCEMENTS_COMPLETE.md#parallel-execution](ENHANCEMENTS_COMPLETE.md)
+1. Human-in-the-loop: [INTERACTIVE_WORKFLOW_EXAMPLES.md](INTERACTIVE_WORKFLOW_EXAMPLES.md)
+2. Retry & Circuit Breaker: [ARCHITECTURE.md#workflow-execution](ARCHITECTURE.md#workflow-execution)
+3. Parallel Execution: [ARCHITECTURE.md#workflow-execution](ARCHITECTURE.md#workflow-execution)
+4. Vector Memory: [../README.md#vector-memory-long-term-recall](../README.md#vector-memory-long-term-recall)
+5. HA Orchestrator: [ENTERPRISE_DEPLOYMENT.md](ENTERPRISE_DEPLOYMENT.md)
 
 ---
 
-## 📖 Documentation Organization
+## 📖 Documentation by Role
 
-### By Role
+### For Users
+- [../README.md](../README.md) — Overview, features, example workflows
+- [QUICK_START.md](QUICK_START.md) — How to start and use the system
+- [CURL_EXAMPLES.md](CURL_EXAMPLES.md) — API call examples
+- [INTERACTIVE_WORKFLOW_EXAMPLES.md](INTERACTIVE_WORKFLOW_EXAMPLES.md) — Human-in-the-loop examples
 
-#### For Users
-- [README.md](README.md) - Overview
-- [QUICK_START.md](QUICK_START.md) - How to use
-- [CURL_EXAMPLES.md](CURL_EXAMPLES.md) - API examples
+### For Operators
+- [DEPLOYMENT.md](DEPLOYMENT.md) — Container deployment
+- [DEPLOYMENT_AWS.md](DEPLOYMENT_AWS.md) — AWS deployment
+- [DEPLOYMENT_AZURE.md](DEPLOYMENT_AZURE.md) — Azure deployment
+- [AWS_CREDENTIALS_GUIDE.md](AWS_CREDENTIALS_GUIDE.md) — Credential configuration
+- [ENTERPRISE_DEPLOYMENT.md](ENTERPRISE_DEPLOYMENT.md) — Enterprise HA and security
 
-#### For Operators
-- [DOCKER_DEPLOYMENT.md](DOCKER_DEPLOYMENT.md) - Deployment
-- [AWS_CREDENTIALS_GUIDE.md](AWS_CREDENTIALS_GUIDE.md) - Configuration
-- [TESTING_GUIDE.md](TESTING_GUIDE.md) - Validation
-
-#### For Developers
-- [ARCHITECTURE.md](ARCHITECTURE.md) - Design
-- [ENHANCEMENTS_COMPLETE.md](ENHANCEMENTS_COMPLETE.md) - New features
-- API documentation in each service
+### For Developers
+- [ARCHITECTURE.md](ARCHITECTURE.md) — System design and internals
+- [COMPONENT_REFERENCE.md](COMPONENT_REFERENCE.md) — Configuration reference
+- [../README.md#service-architecture](../README.md#service-architecture) — Service overview
+- `services/model_gateway/` — Model Gateway source code
 
 ---
 
@@ -133,36 +181,42 @@
 
 | Task | Documentation |
 |------|---------------|
-| Install and start | [QUICK_START.md](QUICK_START.md) |
-| Deploy with Docker | [DOCKER_DEPLOYMENT.md](DOCKER_DEPLOYMENT.md) |
-| Configure AWS | [AWS_CREDENTIALS_GUIDE.md](AWS_CREDENTIALS_GUIDE.md) |
-| Test the system | [TESTING_GUIDE.md](TESTING_GUIDE.md) |
-| Understand architecture | [ARCHITECTURE.md](ARCHITECTURE.md) |
-| Use new features | [ENHANCEMENTS_COMPLETE.md](ENHANCEMENTS_COMPLETE.md) |
+| Install and start (local) | [QUICK_START.md](QUICK_START.md) |
+| Deploy with Docker Compose | [DEPLOYMENT.md](DEPLOYMENT.md) |
+| Deploy to AWS | [DEPLOYMENT_AWS.md](DEPLOYMENT_AWS.md) |
+| Deploy to Azure | [DEPLOYMENT_AZURE.md](DEPLOYMENT_AZURE.md) |
+| Configure AWS credentials | [AWS_CREDENTIALS_GUIDE.md](AWS_CREDENTIALS_GUIDE.md) |
+| Understand the architecture | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| Use the Model Gateway | [ARCHITECTURE.md#model-gateway-port-8400](ARCHITECTURE.md#model-gateway-port-8400) |
+| Set up enterprise auth | [IDENTITY_PROVIDER_SETUP.md](IDENTITY_PROVIDER_SETUP.md) |
+| Enable HA / Redis | [ENTERPRISE_DEPLOYMENT.md](ENTERPRISE_DEPLOYMENT.md) |
 
 ### API References
 
 | Service | Port | Documentation |
 |---------|------|---------------|
-| Registry | 8000 | [ARCHITECTURE.md#registry-service](ARCHITECTURE.md) |
-| Orchestrator | 8100 | [ARCHITECTURE.md#orchestrator-service](ARCHITECTURE.md) |
-| Agents | 8001-8006 | [ARCHITECTURE.md#agent-services](ARCHITECTURE.md) |
-| MCP Gateway | 8300 | [ARCHITECTURE.md#mcp-gateway](ARCHITECTURE.md) |
+| Registry | 8000 | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| Orchestrator | 8100 | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| MCP Registry | 8200 | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| MCP Gateway | 8300 | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| **Model Gateway** | **8400** | **[ARCHITECTURE.md#model-gateway-port-8400](ARCHITECTURE.md#model-gateway-port-8400)** |
+| Agents | 8001–8006 | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| MCP Tools | 8210–8213 | [ARCHITECTURE.md](ARCHITECTURE.md) |
 
 ---
 
 ## 📝 Documentation Standards
 
 ### File Naming
-- `*.md` - Markdown format
-- UPPERCASE for main docs
-- Descriptive names
+- `*.md` — Markdown format
+- UPPERCASE filenames for `docs/` directory
+- Descriptive names matching the content scope
 
 ### Structure
 - Clear hierarchical headings
 - Code examples with syntax highlighting
 - Tables for structured data
-- Diagrams for architecture
+- ASCII diagrams for architecture
 
 ### Content
 - Start with overview/summary
@@ -175,37 +229,24 @@
 ## 🔄 Documentation Updates
 
 ### Version History
-- **v2.0** (2026-02-07) - Consolidated documentation, added enhancements
-- **v1.0** (2025-12-15) - Initial documentation
-
-### Contributing
-To update documentation:
-1. Edit the relevant `.md` file
-2. Follow existing structure and style
-3. Add examples where helpful
-4. Update this index if adding new files
-
----
-
-## 📦 Archive
-
-Old documentation files have been archived in `docs/archive/` for reference:
-- Historical summaries
-- Deprecated guides
-- Implementation notes
-- Merge artifacts
+- **v3.1** (2026-03-23) — Added Model Gateway (port 8400) throughout; updated all links to `docs/` structure; added enterprise, AWS, and Azure deployment guides; added identity provider, interactive workflow, and HA orchestrator documentation
+- **v2.1** (2026-03-23) — Updated with accurate API endpoints, complete capability lists, and detailed how-to-run instructions
+- **v2.0** (2026-02-07) — Consolidated documentation, added enhancements guide
+- **v1.0** (2025-12-15) — Initial documentation
 
 ---
 
 ## 🆘 Need Help?
 
 1. **Can't find something?** Check this index
-2. **Getting started?** Read [QUICK_START.md](QUICK_START.md)
-3. **Deployment issues?** See deployment guides
-4. **Feature questions?** Check [ENHANCEMENTS_COMPLETE.md](ENHANCEMENTS_COMPLETE.md)
+2. **Getting started?** Read [../README.md](../README.md) or [QUICK_START.md](QUICK_START.md)
+3. **Deployment issues?** See [DEPLOYMENT.md](DEPLOYMENT.md) or [AWS_CREDENTIALS_GUIDE.md](AWS_CREDENTIALS_GUIDE.md)
+4. **Model Gateway issues?** See troubleshooting in [QUICK_START.md](QUICK_START.md) and [ARCHITECTURE.md](ARCHITECTURE.md)
+5. **Enterprise / HA?** See [ENTERPRISE_DEPLOYMENT.md](ENTERPRISE_DEPLOYMENT.md)
+6. **Identity / Auth?** See [IDENTITY_PROVIDER_SETUP.md](IDENTITY_PROVIDER_SETUP.md)
 
 ---
 
-**Last Updated**: 2026-02-07  
-**Documentation Version**: 2.0  
-**System Version**: 2.0
+**Last Updated**: 2026-03-23  
+**Documentation Version**: 3.1  
+**System Version**: 3.1
