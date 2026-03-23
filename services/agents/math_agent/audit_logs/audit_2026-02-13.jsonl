@@ -1,0 +1,1 @@
+{"timestamp": "2026-02-13T16:03:53.305157", "workflow_id": "manual_test", "user_id": "manual_tester", "event_type": "AGENT_EXECUTION", "details": {"agent": "MathAgent", "capability": "calculate", "parameters": {"operation": "add", "a": 10, "b": 20}}, "signature": -8320973485896379391}

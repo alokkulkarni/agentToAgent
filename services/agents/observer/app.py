@@ -2,9 +2,7 @@
 Observer Agent - Standalone Service
 Monitors system activity and provides metrics
 """
-import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
@@ -25,6 +23,7 @@ load_dotenv()
 # Configuration
 AGENT_NAME = os.getenv("AGENT_NAME", "Observer")
 AGENT_PORT = int(os.getenv("AGENT_PORT", "8005"))
+AGENT_HOST = os.getenv("AGENT_HOST", "localhost")
 REGISTRY_URL = os.getenv("REGISTRY_URL", "http://localhost:8000")
 
 agent_id = None
@@ -65,7 +64,7 @@ async def register_with_registry():
             )
         ],
         has_llm=False,
-        endpoint=f"http://localhost:{AGENT_PORT}"
+        endpoint=f"http://{AGENT_HOST}:{AGENT_PORT}"
     )
     
     registry_client = A2AClient(REGISTRY_URL)
@@ -264,17 +263,30 @@ async def generate_metrics_report() -> Dict[str, Any]:
 async def get_agent_statistics() -> Dict[str, Any]:
     """Get detailed agent statistics"""
     agents = await registry_client.get_all_agents()
-    capabilities = await registry_client.get_all_capabilities()
-    
-    role_distribution = defaultdict(int)
+
+    # Build capabilities map from agent metadata — A2AClient has no get_all_capabilities()
+    capabilities: Dict[str, List[str]] = defaultdict(list)
+    role_distribution: Dict[str, int] = defaultdict(int)
     for agent in agents:
         role_distribution[agent.role.value] += 1
-    
+        for cap in agent.capabilities:
+            capabilities[cap.name].append(agent.agent_id)
+
     return {
         "timestamp": datetime.utcnow().isoformat(),
         "total_agents": len(agents),
         "total_capabilities": len(capabilities),
         "role_distribution": dict(role_distribution),
+        "agents": [
+            {
+                "agent_id": agent.agent_id,
+                "name": agent.name,
+                "role": agent.role.value,
+                "capabilities": [c.name for c in agent.capabilities],
+                "has_llm": agent.has_llm,
+            }
+            for agent in agents
+        ],
         "capability_coverage": {
             cap: len(agent_ids)
             for cap, agent_ids in capabilities.items()

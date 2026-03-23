@@ -2,9 +2,7 @@
 Calculator MCP Server
 Provides basic and advanced mathematical operations as MCP tools
 """
-import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -18,7 +16,11 @@ load_dotenv()
 
 # Configuration
 SERVER_NAME = os.getenv("MCP_SERVER_NAME", "calculator")
+SERVER_HOST = os.getenv("MCP_SERVER_HOST", "0.0.0.0")  # bind address
 SERVER_PORT = int(os.getenv("MCP_SERVER_PORT", "9001"))
+# PUBLIC_HOST is the hostname other containers use to reach this server.
+# Must match the Docker service name (or external hostname in production).
+PUBLIC_HOST = os.getenv("MCP_CALCULATOR_PUBLIC_HOST", "calculator-server")
 MCP_REGISTRY_URL = os.getenv("MCP_REGISTRY_URL", "http://localhost:8500")
 
 server_id = None
@@ -147,7 +149,7 @@ async def register_with_mcp_registry():
                     json={
                         "name": SERVER_NAME,
                         "description": "Provides basic and advanced mathematical operations",
-                        "base_url": f"http://localhost:{SERVER_PORT}",
+                        "base_url": f"http://{PUBLIC_HOST}:{SERVER_PORT}",
                         "tools": list(TOOLS.values())
                     }
                 )
@@ -259,4 +261,4 @@ async def shutdown_event():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT)
+    uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT)

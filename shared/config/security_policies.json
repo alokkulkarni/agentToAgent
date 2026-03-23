@@ -1,0 +1,139 @@
+{
+  "$schema": "./schemas/security_policies_schema.json",
+  "version": "1.0.0",
+  
+  "global_settings": {
+    "enable_security_checks": true,
+    "strict_mode": false,
+    "default_deny": false,
+    "log_violations": true,
+    "alert_on_violation": false,
+    "max_violations_before_block": 5
+  },
+  
+  "role_permissions": {
+    "admin": {
+      "allowed_tools": ["*"],
+      "max_transaction_limit": 100000.0,
+      "can_bypass_approval": true,
+      "can_access_pii": true
+    },
+    "operator": {
+      "allowed_tools": ["*"],
+      "max_transaction_limit": 10000.0,
+      "can_bypass_approval": false,
+      "can_access_pii": true
+    },
+    "user": {
+      "allowed_tools": ["calculate", "answer_question", "generate_report", "analyze_data", "web_search"],
+      "max_transaction_limit": 2000.0,
+      "can_bypass_approval": false,
+      "can_access_pii": false
+    },
+    "guest": {
+      "allowed_tools": ["answer_question", "calculate"],
+      "max_transaction_limit": 0.0,
+      "can_bypass_approval": false,
+      "can_access_pii": false
+    }
+  },
+  
+  "tool_policies": {
+    "transfer_funds": {
+      "description": "Money transfer operations",
+      "limits": {
+        "amount": {
+          "type": "numeric",
+          "max": 2000.0,
+          "min": 0.01,
+          "currency": "USD"
+        }
+      },
+      "requires_approval": true,
+      "approval_threshold": 500.0,
+      "allowed_roles": ["admin", "operator", "user"],
+      "audit_level": "detailed",
+      "rate_limit": {
+        "max_calls_per_hour": 10,
+        "max_daily_amount": 5000.0
+      }
+    },
+    "calculate": {
+      "description": "Mathematical calculations",
+      "limits": {
+        "a": {
+          "type": "numeric",
+          "max": 1000000.0,
+          "min": -1000000.0
+        },
+        "b": {
+          "type": "numeric", 
+          "max": 1000000.0,
+          "min": -1000000.0
+        }
+      },
+      "requires_approval": false,
+      "allowed_roles": ["*"],
+      "audit_level": "minimal"
+    },
+    "advanced_math": {
+      "description": "Advanced mathematical operations",
+      "limits": {
+        "value": {
+          "type": "numeric",
+          "max": 1000000.0
+        }
+      },
+      "requires_approval": false,
+      "allowed_roles": ["*"],
+      "audit_level": "minimal"
+    },
+    "web_search": {
+      "description": "Web search operations",
+      "limits": {
+        "query_length": {
+          "type": "string_length",
+          "max": 500
+        },
+        "max_results": {
+          "type": "numeric",
+          "max": 20
+        }
+      },
+      "requires_approval": false,
+      "allowed_roles": ["admin", "operator", "user"],
+      "rate_limit": {
+        "max_calls_per_minute": 10
+      },
+      "audit_level": "standard"
+    },
+    "file_operations": {
+      "description": "File read/write operations",
+      "limits": {
+        "file_size_mb": {
+          "type": "numeric",
+          "max": 10
+        }
+      },
+      "requires_approval": true,
+      "allowed_roles": ["admin", "operator"],
+      "blocked_paths": ["/etc", "/var", "/root", "~/.ssh"],
+      "audit_level": "detailed"
+    },
+    "execute_command": {
+      "description": "System command execution",
+      "limits": {},
+      "requires_approval": true,
+      "allowed_roles": ["admin"],
+      "blocked_commands": ["rm -rf", "sudo", "chmod", "chown", "dd"],
+      "audit_level": "detailed"
+    }
+  },
+  
+  "default_policy": {
+    "requires_approval": false,
+    "allowed_roles": ["admin", "operator", "user"],
+    "audit_level": "standard",
+    "max_transaction_limit": 1000.0
+  }
+}

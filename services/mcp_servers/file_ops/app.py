@@ -15,11 +15,13 @@ from datetime import datetime, timezone
 
 
 # Environment Configuration
-SERVER_HOST = os.getenv("MCP_FILE_OPS_HOST", "0.0.0.0")
+SERVER_HOST = os.getenv("MCP_FILE_OPS_HOST", "0.0.0.0")  # bind address
 SERVER_PORT = int(os.getenv("MCP_FILE_OPS_PORT", "8210"))
+# PUBLIC_HOST is the hostname other containers use to reach this server.
+PUBLIC_HOST = os.getenv("MCP_FILE_OPS_PUBLIC_HOST", "file-ops-server")
 MCP_REGISTRY_URL = os.getenv("MCP_REGISTRY_URL", "http://localhost:8200")
 WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/tmp/mcp_workspace")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "info")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "info").lower()
 
 
 # Models
@@ -269,7 +271,7 @@ async def register_with_registry():
         "server_id": server_id,
         "name": "FileOperationsServer",
         "description": "Provides file system operations (read, write, list, delete)",
-        "base_url": f"http://{SERVER_HOST}:{SERVER_PORT}",
+        "base_url": f"http://{PUBLIC_HOST}:{SERVER_PORT}",
         "tools": tools,
         "metadata": {
             "workspace": WORKSPACE_DIR

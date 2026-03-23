@@ -1,11 +1,11 @@
 """
 MCP Gateway Service
-Routes tool execution requests to appropriate MCP servers
+Routes tool execution requests to appropriate MCP servers with authentication support
 """
 import os
 import json
 from typing import Dict, List, Optional, Any
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel, Field
 import uvicorn
 import httpx
@@ -13,8 +13,14 @@ import boto3
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 
+from shared.identity_provider import get_identity_provider, UserContext
+from shared.auth_dependencies import get_current_user
+
 # Load environment variables from .env file
 load_dotenv()
+
+# Initialize identity provider
+identity_provider = get_identity_provider()
 
 # Environment Configuration
 GATEWAY_HOST = os.getenv("MCP_GATEWAY_HOST", "0.0.0.0")
@@ -22,7 +28,7 @@ GATEWAY_PORT = int(os.getenv("MCP_GATEWAY_PORT", "8220"))
 MCP_REGISTRY_URL = os.getenv("MCP_REGISTRY_URL", "http://localhost:8200")
 AWS_REGION = os.getenv("AWS_REGION", "eu-west-2")
 BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20241022-v2:0")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "info")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "info").lower()
 
 
 # Initialize Bedrock client
@@ -49,6 +55,10 @@ class ToolCall(BaseModel):
     tool_name: str
     parameters: Dict[str, Any]
     prefer_server: Optional[str] = None
+    # Trace context — propagated from orchestrator for end-to-end observability
+    workflow_id: Optional[str] = None
+    session_id: Optional[str] = None
+    user_id: Optional[str] = None
 
 
 class GatewayRequest(BaseModel):
@@ -81,12 +91,13 @@ async def root():
         "service": "MCP Gateway",
         "status": "running",
         "registry_url": MCP_REGISTRY_URL,
-        "bedrock_available": bedrock_client is not None
+        "bedrock_available": bedrock_client is not None,
+        "auth_enabled": identity_provider.enabled
     }
 
 
 async def discover_tools():
-    """Discover available tools from registry"""
+    """Discover available tools from registry with auth metadata"""
     try:
         response = await http_client.get(f"{MCP_REGISTRY_URL}/api/mcp/tools")
         if response.status_code == 200:
@@ -95,6 +106,18 @@ async def discover_tools():
     except Exception as e:
         print(f"Error discovering tools: {e}")
         return {"total_tools": 0, "tools": []}
+
+
+async def get_tool_auth_requirements(tool_name: str) -> Optional[Dict]:
+    """Get authentication requirements for a specific tool from registry"""
+    try:
+        response = await http_client.get(f"{MCP_REGISTRY_URL}/api/mcp/tools/{tool_name}/auth")
+        if response.status_code == 200:
+            return response.json()
+        return None
+    except Exception as e:
+        print(f"Error getting auth requirements for {tool_name}: {e}")
+        return None
 
 
 async def find_server_for_tool(tool_name: str, prefer_server: Optional[str] = None):
@@ -123,12 +146,22 @@ async def find_server_for_tool(tool_name: str, prefer_server: Optional[str] = No
         return None
 
 
-async def execute_tool_on_server(server_url: str, tool_name: str, parameters: Dict):
-    """Execute tool on specific MCP server"""
+async def execute_tool_on_server(
+    server_url: str, 
+    tool_name: str, 
+    parameters: Dict,
+    auth_token: Optional[str] = None
+):
+    """Execute tool on specific MCP server with optional authentication"""
     try:
+        headers = {}
+        if auth_token:
+            headers["Authorization"] = f"Bearer {auth_token}"
+        
         response = await http_client.post(
             f"{server_url}/api/tools/execute",
-            json={"tool_name": tool_name, "parameters": parameters}
+            json={"tool_name": tool_name, "parameters": parameters},
+            headers=headers
         )
         
         if response.status_code == 200:
@@ -230,7 +263,10 @@ Format your response as valid JSON only."""
 
 
 @app.post("/api/gateway/query")
-async def process_query(request: GatewayRequest):
+async def process_query(
+    request: GatewayRequest,
+    user: UserContext = Depends(get_current_user)
+):
     """Process a natural language query and route to appropriate tools"""
     
     # Discover available tools
@@ -255,15 +291,39 @@ async def process_query(request: GatewayRequest):
             # Get parameters for this tool
             tool_params = analysis.get("parameters", {}).get(tool_name, {})
             
+            # Get auth requirements for tool
+            auth_requirements = await get_tool_auth_requirements(tool_name)
+            auth_token = None
+            
+            if auth_requirements and auth_requirements.get("auth_schema", {}).get("auth_type") != "none":
+                required_scopes = auth_requirements.get("auth_schema", {}).get("required_scopes", [])
+                if required_scopes:
+                    # Get tool-specific token using OBO flow
+                    try:
+                        auth_token = await identity_provider.get_token_for_scope(
+                            user, 
+                            required_scopes,
+                            resource=auth_requirements.get("auth_schema", {}).get("audience")
+                        )
+                        print(f"✓ Got auth token for tool {tool_name} with scopes: {required_scopes}")
+                    except Exception as e:
+                        print(f"⚠️  Failed to get auth token for {tool_name}: {e}")
+                        results["tool_executions"].append({
+                            "tool_name": tool_name,
+                            "error": f"Authentication failed: {str(e)}"
+                        })
+                        continue
+            
             # Find server for tool
             server_info = await find_server_for_tool(tool_name)
             
             if server_info:
-                # Execute tool
+                # Execute tool with auth
                 result = await execute_tool_on_server(
                     server_info["server_url"],
                     tool_name,
-                    tool_params
+                    tool_params,
+                    auth_token=auth_token
                 )
                 
                 results["tool_executions"].append({
@@ -271,7 +331,8 @@ async def process_query(request: GatewayRequest):
                     "server_name": server_info["server_name"],
                     "server_id": server_info["server_id"],
                     "parameters": tool_params,
-                    "result": result
+                    "result": result,
+                    "authenticated": auth_token is not None
                 })
             else:
                 results["tool_executions"].append({
@@ -283,9 +344,67 @@ async def process_query(request: GatewayRequest):
 
 
 @app.post("/api/gateway/execute")
+async def execute_tool(
+    tool_call: ToolCall,
+    user: UserContext = Depends(get_current_user)
+):
+    """Execute a specific tool directly with authentication"""
+    
+    # Get auth requirements for the tool
+    auth_requirements = await get_tool_auth_requirements(tool_call.tool_name)
+    auth_token = None
+    
+    if auth_requirements and auth_requirements.get("auth_schema", {}).get("auth_type") != "none":
+        required_scopes = auth_requirements.get("auth_schema", {}).get("required_scopes", [])
+        if required_scopes:
+            # Get tool-specific token using OBO flow
+            try:
+                auth_token = await identity_provider.get_token_for_scope(
+                    user,
+                    required_scopes,
+                    resource=auth_requirements.get("auth_schema", {}).get("audience")
+                )
+                print(f"✓ Got auth token for tool {tool_call.tool_name}")
+            except Exception as e:
+                raise HTTPException(
+                    status_code=401,
+                    detail=f"Failed to obtain required authentication: {str(e)}"
+                )
+    
+    # Find server for tool
+    server_info = await find_server_for_tool(tool_call.tool_name, tool_call.prefer_server)
+    
+    if not server_info:
+        raise HTTPException(status_code=404, detail=f"No server found for tool: {tool_call.tool_name}")
+    
+    # Execute tool with auth
+    result = await execute_tool_on_server(
+        server_info["server_url"],
+        tool_call.tool_name,
+        tool_call.parameters,
+        auth_token=auth_token
+    )
+    
+    return ToolResult(
+        tool_name=tool_call.tool_name,
+        server_name=server_info["server_name"],
+        server_id=server_info["server_id"],
+        result=result
+    )
+
+
+@app.post("/api/gateway/execute")
 async def execute_tool(tool_call: ToolCall):
     """Execute a specific tool directly"""
     
+    if tool_call.workflow_id:
+        print(
+            f"[MCP] execute tool={tool_call.tool_name}"
+            f" workflow={tool_call.workflow_id}"
+            f" session={tool_call.session_id or '-'}"
+            f" user={tool_call.user_id or '-'}"
+        )
+
     # Find server for tool
     server_info = await find_server_for_tool(tool_call.tool_name, tool_call.prefer_server)
     

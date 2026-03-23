@@ -1,0 +1,157 @@
+{
+  "$schema": "./schemas/guardrails_config_schema.json",
+  "version": "1.0.0",
+  
+  "pii_detection": {
+    "enabled": true,
+    "action": "tokenize",
+    "patterns": {
+      "SSN": {
+        "regex": "\\b\\d{3}-\\d{2}-\\d{4}\\b",
+        "description": "US Social Security Number",
+        "sensitivity": "high",
+        "redaction_format": "[SSN_REDACTED]"
+      },
+      "CreditCard": {
+        "regex": "\\b\\d{4}[- ]?\\d{4}[- ]?\\d{4}[- ]?\\d{4}\\b",
+        "description": "Credit Card Number",
+        "sensitivity": "high",
+        "redaction_format": "[CC_REDACTED]"
+      },
+      "Email": {
+        "regex": "\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Z|a-z]{2,}\\b",
+        "description": "Email Address",
+        "sensitivity": "medium",
+        "redaction_format": "[EMAIL_REDACTED]"
+      },
+      "Phone": {
+        "regex": "\\b(?:\\+1[-. ]?)?\\(?\\d{3}\\)?[-. ]?\\d{3}[-. ]?\\d{4}\\b",
+        "description": "US Phone Number",
+        "sensitivity": "medium",
+        "redaction_format": "[PHONE_REDACTED]"
+      },
+      "IPAddress": {
+        "regex": "\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b",
+        "description": "IP Address",
+        "sensitivity": "low",
+        "redaction_format": "[IP_REDACTED]"
+      },
+      "BankAccount": {
+        "regex": "\\b\\d{8,17}\\b",
+        "description": "Bank Account Number (generic)",
+        "sensitivity": "high",
+        "redaction_format": "[ACCOUNT_REDACTED]",
+        "context_required": ["account", "routing", "bank"]
+      }
+    }
+  },
+  
+  "input_rails": {
+    "enabled": true,
+    "sensitive_terms": [
+      {
+        "term": "jailbreak",
+        "action": "block",
+        "message": "Potential jailbreak attempt detected"
+      },
+      {
+        "term": "ignore previous instructions",
+        "action": "block",
+        "message": "Instruction override attempt detected"
+      },
+      {
+        "term": "system override",
+        "action": "block",
+        "message": "System override attempt detected"
+      },
+      {
+        "term": "prompt injection",
+        "action": "block",
+        "message": "Prompt injection attempt detected"
+      },
+      {
+        "term": "ignore your training",
+        "action": "block",
+        "message": "Training bypass attempt detected"
+      },
+      {
+        "term": "pretend you are",
+        "action": "warn",
+        "message": "Role-play request detected - reviewing"
+      }
+    ],
+    "max_input_length": 50000,
+    "block_code_injection": true,
+    "block_sql_injection": true
+  },
+  
+  "output_rails": {
+    "enabled": true,
+    "denied_topics": [
+      {
+        "topic": "political_advice",
+        "keywords": ["vote for", "political party", "election strategy"],
+        "action": "block",
+        "message": "Political advice is not provided by this system"
+      },
+      {
+        "topic": "medical_advice",
+        "keywords": ["take medication", "diagnosis is", "treatment plan"],
+        "action": "warn_and_disclaim",
+        "message": "Medical advice should be obtained from healthcare professionals"
+      },
+      {
+        "topic": "illegal_activities",
+        "keywords": ["how to hack", "bypass security", "exploit vulnerability"],
+        "action": "block",
+        "message": "This request cannot be processed"
+      },
+      {
+        "topic": "competitor_mentions",
+        "keywords": [],
+        "action": "redact",
+        "message": "Competitor information redacted"
+      }
+    ],
+    "max_output_length": 100000
+  },
+  
+  "disclaimers": [
+    {
+      "id": "financial_disclaimer",
+      "trigger_keywords": ["financial", "investment", "stock", "crypto", "trading", "portfolio"],
+      "message": "\n\n---\n**DISCLAIMER**: This is AI-generated content and does not constitute professional financial advice. Please consult a qualified financial advisor before making any investment decisions.",
+      "position": "append",
+      "enabled": true
+    },
+    {
+      "id": "medical_disclaimer", 
+      "trigger_keywords": ["medical", "treatment", "diagnosis", "symptoms", "medication", "health"],
+      "message": "\n\n---\n**DISCLAIMER**: This information is for educational purposes only and is not medical advice. Please consult a healthcare professional for medical concerns.",
+      "position": "append",
+      "enabled": true
+    },
+    {
+      "id": "legal_disclaimer",
+      "trigger_keywords": ["legal", "lawsuit", "contract", "liability", "court"],
+      "message": "\n\n---\n**DISCLAIMER**: This is not legal advice. Please consult a qualified attorney for legal matters.",
+      "position": "append",
+      "enabled": true
+    }
+  ],
+  
+  "content_moderation": {
+    "enabled": true,
+    "check_toxicity": true,
+    "check_profanity": true,
+    "toxicity_threshold": 0.7,
+    "profanity_action": "redact"
+  },
+  
+  "rate_limiting": {
+    "enabled": true,
+    "violation_cooldown_seconds": 60,
+    "max_violations_per_session": 3,
+    "block_duration_minutes": 30
+  }
+}

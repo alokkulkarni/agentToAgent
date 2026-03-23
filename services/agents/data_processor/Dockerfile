@@ -1,12 +1,18 @@
 FROM python:3.11-slim
 
+# Stage 1: install shared package
+WORKDIR /build
+COPY shared/ /build/shared/
+RUN pip install --no-cache-dir /build/shared/
+
+# Stage 2: install service dependencies
+COPY services/agents/data_processor/requirements.txt /build/requirements.txt
+RUN pip install --no-cache-dir -r /build/requirements.txt
+
+# Stage 3: copy service source flat
 WORKDIR /app
-
-COPY shared/ /app/shared/
-COPY services/agents/data_processor/ /app/services/agents/data_processor/
-
-RUN pip install --no-cache-dir -r /app/services/agents/data_processor/requirements.txt
+COPY services/agents/data_processor/ /app/
 
 EXPOSE 8002
 
-CMD ["python", "services/agents/data_processor/app.py"]
+CMD ["python", "app.py"]

@@ -8,7 +8,7 @@ from typing import Optional, List, Dict, Any
 from contextlib import contextmanager
 import os
 
-from .models import (
+from models import (
     WorkflowRecord, StepRecord, WorkflowStatus, StepStatus
 )
 
@@ -47,12 +47,14 @@ class WorkflowDatabase:
                     status TEXT NOT NULL,
                     total_steps INTEGER DEFAULT 0,
                     completed_steps INTEGER DEFAULT 0,
+                    current_step INTEGER DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     started_at TEXT,
                     completed_at TEXT,
                     error_message TEXT,
                     workflow_context TEXT,
+                    workflow_state TEXT,
                     execution_plan TEXT,
                     results TEXT
                 )
@@ -98,6 +100,9 @@ class WorkflowDatabase:
                 CREATE INDEX IF NOT EXISTS idx_steps_status 
                 ON steps(status)
             """)
+        
+        # Initialize interaction tables
+        self.init_interaction_tables()
     
     def save_workflow(self, workflow: WorkflowRecord):
         """Save or update workflow record"""
@@ -105,24 +110,58 @@ class WorkflowDatabase:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT OR REPLACE INTO workflows 
-                (workflow_id, task_description, status, total_steps, completed_steps,
+                (workflow_id, task_description, status, total_steps, completed_steps, current_step,
                  created_at, updated_at, started_at, completed_at, error_message,
-                 workflow_context, execution_plan, results)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 workflow_context, workflow_state, execution_plan, results)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 workflow.workflow_id,
                 workflow.task_description,
-                workflow.status.value,
+                workflow.status.value if isinstance(workflow.status, WorkflowStatus) else workflow.status,
                 workflow.total_steps,
                 workflow.completed_steps,
+                workflow.current_step,
                 workflow.created_at.isoformat(),
                 workflow.updated_at.isoformat(),
                 workflow.started_at.isoformat() if workflow.started_at else None,
                 workflow.completed_at.isoformat() if workflow.completed_at else None,
                 workflow.error_message,
                 json.dumps(workflow.workflow_context),
+                json.dumps(workflow.workflow_state),
                 json.dumps(workflow.execution_plan),
                 json.dumps(workflow.results)
+            ))
+    
+    def update_workflow_state(self, workflow_id: str, state_data: Dict[str, Any]):
+        """Update workflow state during execution (for pausing, etc.)"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE workflows 
+                SET status = ?,
+                    workflow_context = ?,
+                    updated_at = ?
+                WHERE workflow_id = ?
+            """, (
+                state_data.get("status", "running"),
+                json.dumps(state_data),
+                datetime.utcnow().isoformat(),
+                workflow_id
+            ))
+    
+    def update_workflow_status(self, workflow_id: str, status: str):
+        """Update workflow status"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE workflows 
+                SET status = ?,
+                    updated_at = ?
+                WHERE workflow_id = ?
+            """, (
+                status,
+                datetime.utcnow().isoformat(),
+                workflow_id
             ))
     
     def get_workflow(self, workflow_id: str) -> Optional[WorkflowRecord]:
@@ -137,18 +176,24 @@ class WorkflowDatabase:
             if not row:
                 return None
             
+            # Handle old rows that might not have current_step or workflow_state
+            current_step = row['current_step'] if 'current_step' in row.keys() else 0
+            workflow_state = row['workflow_state'] if 'workflow_state' in row.keys() else None
+            
             return WorkflowRecord(
                 workflow_id=row['workflow_id'],
                 task_description=row['task_description'],
                 status=WorkflowStatus(row['status']),
                 total_steps=row['total_steps'],
                 completed_steps=row['completed_steps'],
+                current_step=current_step,
                 created_at=datetime.fromisoformat(row['created_at']),
                 updated_at=datetime.fromisoformat(row['updated_at']),
                 started_at=datetime.fromisoformat(row['started_at']) if row['started_at'] else None,
                 completed_at=datetime.fromisoformat(row['completed_at']) if row['completed_at'] else None,
                 error_message=row['error_message'],
                 workflow_context=json.loads(row['workflow_context']) if row['workflow_context'] else {},
+                workflow_state=json.loads(workflow_state) if workflow_state else {},
                 execution_plan=json.loads(row['execution_plan']) if row['execution_plan'] else {},
                 results=json.loads(row['results']) if row['results'] else []
             )
@@ -288,3 +333,430 @@ class WorkflowDatabase:
                 ))
             
             return workflows
+
+
+# ============================================================================
+# INTERACTIVE WORKFLOW DATABASE OPERATIONS
+# ============================================================================
+
+    def init_interaction_tables(self):
+        """Initialize tables for interactive workflows"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Conversation messages table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS conversation_messages (
+                    message_id TEXT PRIMARY KEY,
+                    workflow_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    message_type TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    metadata TEXT,
+                    requires_response INTEGER DEFAULT 0,
+                    parent_message_id TEXT,
+                    FOREIGN KEY (workflow_id) REFERENCES workflows(workflow_id)
+                )
+            """)
+            
+            # Interaction requests table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS interaction_requests (
+                    request_id TEXT PRIMARY KEY,
+                    workflow_id TEXT NOT NULL,
+                    step_id TEXT NOT NULL,
+                    agent_name TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    timeout_at TEXT,
+                    question TEXT NOT NULL,
+                    input_type TEXT NOT NULL,
+                    options TEXT,
+                    default_value TEXT,
+                    context TEXT,
+                    reasoning TEXT,
+                    partial_results TEXT,
+                    response TEXT,
+                    response_received_at TEXT,
+                    response_metadata TEXT,
+                    status TEXT DEFAULT 'pending',
+                    FOREIGN KEY (workflow_id) REFERENCES workflows(workflow_id)
+                )
+            """)
+            
+            # Thought trail table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS thought_trail (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workflow_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    step_id TEXT,
+                    agent TEXT,
+                    thought_type TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    metadata TEXT,
+                    FOREIGN KEY (workflow_id) REFERENCES workflows(workflow_id)
+                )
+            """)
+            
+            # Create indexes
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_conversation_workflow 
+                ON conversation_messages(workflow_id)
+            """)
+            
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_interaction_workflow 
+                ON interaction_requests(workflow_id)
+            """)
+            
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_thought_workflow 
+                ON thought_trail(workflow_id)
+            """)
+            
+            # Sessions table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS sessions (
+                    session_id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    history TEXT  -- JSON list of interactions
+                )
+            """)
+
+    def save_session_history(self, session_id: str, history_item: Dict[str, Any]):
+        """Append an item to session history"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Get existing history
+            cursor.execute("SELECT history FROM sessions WHERE session_id = ?", (session_id,))
+            row = cursor.fetchone()
+            
+            if row:
+                history = json.loads(row['history']) if row['history'] else []
+                history.append(history_item)
+                
+                cursor.execute("""
+                    UPDATE sessions 
+                    SET history = ?, updated_at = ?
+                    WHERE session_id = ?
+                """, (json.dumps(history), datetime.utcnow().isoformat(), session_id))
+            else:
+                history = [history_item]
+                cursor.execute("""
+                    INSERT INTO sessions (session_id, created_at, updated_at, history)
+                    VALUES (?, ?, ?, ?)
+                """, (session_id, datetime.utcnow().isoformat(), datetime.utcnow().isoformat(), json.dumps(history)))
+
+    def get_session_history(self, session_id: str) -> List[Dict[str, Any]]:
+        """Get session history"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT history FROM sessions WHERE session_id = ?", (session_id,))
+            row = cursor.fetchone()
+            
+            if row and row['history']:
+                return json.loads(row['history'])
+            return []
+    
+    def save_message(self, message: 'ConversationMessage'):
+        """Save conversation message"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO conversation_messages
+                (message_id, workflow_id, timestamp, role, message_type, content,
+                 metadata, requires_response, parent_message_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                message.message_id,
+                message.workflow_id,
+                message.timestamp.isoformat(),
+                message.role.value,
+                message.message_type.value,
+                message.content,
+                json.dumps(message.metadata),
+                1 if message.requires_response else 0,
+                message.parent_message_id
+            ))
+    
+    def get_conversation(self, workflow_id: str) -> List['ConversationMessage']:
+        """Get full conversation history for workflow"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM conversation_messages 
+                WHERE workflow_id = ?
+                ORDER BY timestamp
+            """, (workflow_id,))
+            
+            from models import ConversationMessage, MessageRole, MessageType
+            messages = []
+            for row in cursor.fetchall():
+                messages.append(ConversationMessage(
+                    message_id=row['message_id'],
+                    workflow_id=row['workflow_id'],
+                    timestamp=datetime.fromisoformat(row['timestamp']),
+                    role=MessageRole(row['role']),
+                    message_type=MessageType(row['message_type']),
+                    content=row['content'],
+                    metadata=json.loads(row['metadata']) if row['metadata'] else {},
+                    requires_response=bool(row['requires_response']),
+                    parent_message_id=row['parent_message_id']
+                ))
+            
+            return messages
+    
+    def save_interaction_request(self, request: 'InteractionRequest'):
+        """Save interaction request"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO interaction_requests
+                (request_id, workflow_id, step_id, agent_name, created_at, timeout_at,
+                 question, input_type, options, default_value, context, reasoning,
+                 partial_results, response, response_received_at, response_metadata, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                request.request_id,
+                request.workflow_id,
+                request.step_id,
+                request.agent_name,
+                request.created_at.isoformat(),
+                request.timeout_at.isoformat() if request.timeout_at else None,
+                request.question,
+                request.input_type.value,
+                json.dumps(request.options) if request.options else None,
+                json.dumps(request.default_value) if request.default_value else None,
+                json.dumps(request.context),
+                request.reasoning,
+                json.dumps(request.partial_results) if request.partial_results else None,
+                json.dumps(request.response) if request.response else None,
+                request.response_received_at.isoformat() if request.response_received_at else None,
+                json.dumps(request.response_metadata),
+                request.status
+            ))
+    
+    def get_interaction_request(self, request_id: str) -> Optional['InteractionRequest']:
+        """Get interaction request by ID"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM interaction_requests WHERE request_id = ?
+            """, (request_id,))
+            row = cursor.fetchone()
+            
+            if not row:
+                return None
+            
+            from models import InteractionRequest, InputType
+            return InteractionRequest(
+                request_id=row['request_id'],
+                workflow_id=row['workflow_id'],
+                step_id=row['step_id'],
+                agent_name=row['agent_name'],
+                created_at=datetime.fromisoformat(row['created_at']),
+                timeout_at=datetime.fromisoformat(row['timeout_at']) if row['timeout_at'] else None,
+                question=row['question'],
+                input_type=InputType(row['input_type']),
+                options=json.loads(row['options']) if row['options'] else None,
+                default_value=json.loads(row['default_value']) if row['default_value'] else None,
+                context=json.loads(row['context']) if row['context'] else {},
+                reasoning=row['reasoning'],
+                partial_results=json.loads(row['partial_results']) if row['partial_results'] else None,
+                response=json.loads(row['response']) if row['response'] else None,
+                response_received_at=datetime.fromisoformat(row['response_received_at']) if row['response_received_at'] else None,
+                response_metadata=json.loads(row['response_metadata']) if row['response_metadata'] else {},
+                status=row['status']
+            )
+    
+    def get_pending_interaction(self, workflow_id: str) -> Optional['InteractionRequest']:
+        """Get pending interaction request for workflow"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM interaction_requests 
+                WHERE workflow_id = ? AND status = 'pending'
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (workflow_id,))
+            row = cursor.fetchone()
+            
+            if not row:
+                return None
+            
+            from models import InteractionRequest, InputType
+            return InteractionRequest(
+                request_id=row['request_id'],
+                workflow_id=row['workflow_id'],
+                step_id=row['step_id'],
+                agent_name=row['agent_name'],
+                created_at=datetime.fromisoformat(row['created_at']),
+                timeout_at=datetime.fromisoformat(row['timeout_at']) if row['timeout_at'] else None,
+                question=row['question'],
+                input_type=InputType(row['input_type']),
+                options=json.loads(row['options']) if row['options'] else None,
+                default_value=json.loads(row['default_value']) if row['default_value'] else None,
+                context=json.loads(row['context']) if row['context'] else {},
+                reasoning=row['reasoning'],
+                partial_results=json.loads(row['partial_results']) if row['partial_results'] else None,
+                response=json.loads(row['response']) if row['response'] else None,
+                response_received_at=datetime.fromisoformat(row['response_received_at']) if row['response_received_at'] else None,
+                response_metadata=json.loads(row['response_metadata']) if row['response_metadata'] else {},
+                status=row['status']
+            )
+    
+    def get_answered_interaction(self, workflow_id: str) -> Optional['InteractionRequest']:
+        """Get answered (but not completed) interaction request for workflow"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM interaction_requests 
+                WHERE workflow_id = ? AND status = 'answered'
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (workflow_id,))
+            row = cursor.fetchone()
+            
+            if not row:
+                return None
+            
+            from models import InteractionRequest, InputType
+            return InteractionRequest(
+                request_id=row['request_id'],
+                workflow_id=row['workflow_id'],
+                step_id=row['step_id'],
+                agent_name=row['agent_name'],
+                created_at=datetime.fromisoformat(row['created_at']),
+                timeout_at=datetime.fromisoformat(row['timeout_at']) if row['timeout_at'] else None,
+                question=row['question'],
+                input_type=InputType(row['input_type']),
+                options=json.loads(row['options']) if row['options'] else None,
+                default_value=json.loads(row['default_value']) if row['default_value'] else None,
+                context=json.loads(row['context']) if row['context'] else {},
+                reasoning=row['reasoning'],
+                partial_results=json.loads(row['partial_results']) if row['partial_results'] else None,
+                response=json.loads(row['response']) if row['response'] else None,
+                response_received_at=datetime.fromisoformat(row['response_received_at']) if row['response_received_at'] else None,
+                response_metadata=json.loads(row['response_metadata']) if row['response_metadata'] else {},
+                status=row['status']
+            )
+    
+    def get_completed_interactions_for_step(
+        self, workflow_id: str, step_id: str
+    ) -> List['InteractionRequest']:
+        """Return all answered/completed interaction requests for a given step,
+        ordered chronologically (oldest first).  Used to reconstruct the full
+        multi-turn Q&A history when re-executing a paused step."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM interaction_requests
+                WHERE workflow_id = ? AND step_id = ?
+                  AND status IN ('answered', 'completed')
+                ORDER BY created_at ASC
+            """, (workflow_id, step_id))
+            rows = cursor.fetchall()
+
+            from models import InteractionRequest, InputType
+            import json as _json
+            results = []
+            for row in rows:
+                results.append(InteractionRequest(
+                    request_id=row['request_id'],
+                    workflow_id=row['workflow_id'],
+                    step_id=row['step_id'],
+                    agent_name=row['agent_name'],
+                    created_at=datetime.fromisoformat(row['created_at']),
+                    timeout_at=datetime.fromisoformat(row['timeout_at']) if row['timeout_at'] else None,
+                    question=row['question'],
+                    input_type=InputType(row['input_type']),
+                    options=_json.loads(row['options']) if row['options'] else None,
+                    default_value=_json.loads(row['default_value']) if row['default_value'] else None,
+                    context=_json.loads(row['context']) if row['context'] else {},
+                    reasoning=row['reasoning'],
+                    partial_results=_json.loads(row['partial_results']) if row['partial_results'] else None,
+                    response=_json.loads(row['response']) if row['response'] else None,
+                    response_received_at=datetime.fromisoformat(row['response_received_at']) if row['response_received_at'] else None,
+                    response_metadata=_json.loads(row['response_metadata']) if row['response_metadata'] else {},
+                    status=row['status']
+                ))
+            return results
+
+    def get_all_interaction_requests(self) -> List[Dict]:
+        """Get all interaction requests for debugging"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT request_id, workflow_id, status, question 
+                FROM interaction_requests 
+                ORDER BY created_at DESC 
+                LIMIT 20
+            """)
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+    
+    def save_thought(self, workflow_id: str, thought: 'ThoughtTrailEntry'):
+        """Save thought trail entry"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO thought_trail
+                (workflow_id, timestamp, step_id, agent, thought_type, content, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                workflow_id,
+                thought.timestamp.isoformat(),
+                thought.step_id,
+                thought.agent,
+                thought.thought_type,
+                thought.content,
+                json.dumps(thought.metadata)
+            ))
+    
+    def get_thought_trail(self, workflow_id: str) -> List['ThoughtTrailEntry']:
+        """Get thought trail for workflow"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM thought_trail 
+                WHERE workflow_id = ?
+                ORDER BY timestamp
+            """, (workflow_id,))
+            
+            from models import ThoughtTrailEntry
+            thoughts = []
+            for row in cursor.fetchall():
+                thoughts.append(ThoughtTrailEntry(
+                    timestamp=datetime.fromisoformat(row['timestamp']),
+                    step_id=row['step_id'],
+                    agent=row['agent'],
+                    thought_type=row['thought_type'],
+                    content=row['content'],
+                    metadata=json.loads(row['metadata']) if row['metadata'] else {}
+                ))
+            
+            return thoughts
+    
+    def get_workflow_context(self, workflow_id: str) -> Optional['WorkflowContext']:
+        """Get complete workflow context"""
+        workflow = self.get_workflow(workflow_id)
+        if not workflow:
+            return None
+        
+        from models import WorkflowContext
+        context = WorkflowContext(
+            workflow_id=workflow_id,
+            original_task=workflow.task_description,
+            current_step=workflow.completed_steps + 1 if workflow.completed_steps < workflow.total_steps else None,
+            conversation=self.get_conversation(workflow_id),
+            thought_trail=self.get_thought_trail(workflow_id),
+            step_results=workflow.workflow_context.get('step_results', {}),
+            pending_interaction=self.get_pending_interaction(workflow_id),
+            variables=workflow.workflow_context.get('variables', {})
+        )
+        
+        return context
+

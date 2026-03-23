@@ -2,33 +2,57 @@
 Orchestrator Service - Standalone Orchestration Service
 Coordinates multi-agent workflows using A2A protocol
 """
-import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import asyncio
 import json
 from datetime import datetime
 import boto3
 from dotenv import load_dotenv
+import uuid
+from collections import defaultdict
 
 from shared.a2a_protocol import (
     AgentMetadata, AgentRole, AgentCapability,
     TaskRequest, TaskResponse, TaskStatus,
     A2AClient
 )
+from shared.config import EnterpriseConfig
+from shared.guardrails import GuardrailService
+from shared.audit import AuditLogger
+from shared.security import SecurityManager
+from shared.identity_provider import get_identity_provider, UserContext
+from shared.auth_dependencies import get_current_user, get_user_headers
+from shared.vector_memory import get_vector_memory, VectorMemoryStore
+from shared.distributed_state import get_distributed_state, DistributedState
+try:
+    from models import WorkflowRecord, WorkflowStatus, StepRecord, StepStatus
+except ImportError:
+    from .models import WorkflowRecord, WorkflowStatus, StepRecord, StepStatus  # type: ignore
 
 load_dotenv()
+
+# Initialize Enterprise Services
+guardrails = GuardrailService()
+audit_logger = AuditLogger()
+security_manager = SecurityManager()
+identity_provider = get_identity_provider()
+vector_memory = get_vector_memory()
+# Distributed state (replaces per-process active_workflows dict and session_store).
+# Backed by Redis in HA mode (HA_BACKEND=redis) or in-memory for single-node dev.
+dist_state: DistributedState = get_distributed_state()
 
 
 async def enrich_with_workflow_context(
     capability: str,
     parameters: Dict[str, Any],
     workflow_context: Dict[str, Any],
-    step_description: str
+    step_description: str,
+    session_history: List[Dict] = None
 ) -> Dict[str, Any]:
     """
     Dynamically enrich parameters using accumulated workflow context.
@@ -38,9 +62,205 @@ async def enrich_with_workflow_context(
     step_results = workflow_context.get("step_results", {})
     capability_outputs = workflow_context.get("capability_outputs", {})
     
+    # Pre-append session history to 'context' or 'question' if available
+    # Specifically for ResearchAgent capabilities
+    if session_history and (capability in ['answer_question', 'generate_report', 'research', 'explain_code']):
+        history_context = "\n\n--- PREVIOUS SESSION HISTORY ---\n"
+        for i, entry in enumerate(session_history[-5:]): # Increased to last 5 turns
+             history_context += f"Turn {i+1} Task: {entry['task']}\nTurn {i+1} Result: {str(entry['result'])[:800]}\n\n"
+        
+        # Inject into 'context' parameter if it exists or create it
+        if 'context' in enriched:
+            # Check if it's already a string
+            if isinstance(enriched['context'], str):
+                enriched['context'] = history_context + enriched['context']
+            else:
+                enriched['context'] = history_context
+        else:
+            enriched['context'] = history_context
+            
+        print(f"         ✓ Injected {len(session_history)} session history items into context")
+            
     print(f"      🔗 Context enrichment for '{capability}'...")
+
+    # Strategy -1: Resolve {{step_id.result}} / {{step_id.anything}} mustache templates
+    # The LLM often uses this syntax to reference prior steps by their plan-assigned id.
+    import re as _re
+    _mustache = _re.compile(r'\{\{([\w]+)\.([\w]+)\}\}')
+
+    def _resolve_mustache(value):
+        """Replace all {{id.field}} occurrences in a string with the actual result."""
+        if not isinstance(value, str):
+            return value
+        def _sub(m):
+            ref_id, ref_field = m.group(1), m.group(2)
+            # 1. Look up by plan step id or step_N key in step_results
+            entry = step_results.get(ref_id)
+            if entry is None:
+                # 2. Try capability_outputs keyed by capability name
+                cap_val = capability_outputs.get(ref_id)
+                if cap_val is not None:
+                    result = cap_val
+                    if isinstance(result, dict):
+                        return str(result.get(ref_field, result.get('result', result.get('answer', str(result)))))
+                    return str(result)
+                return m.group(0)  # leave unresolved template as-is
+            result = entry.get('result', '')
+            if isinstance(result, dict):
+                return str(result.get(ref_field, result.get('result', result.get('answer', str(result)))))
+            return str(result)
+        return _mustache.sub(_sub, value)
+
+    for key, value in list(enriched.items()):
+        if isinstance(value, str) and '{{' in value:
+            resolved = _resolve_mustache(value)
+            if resolved != value:
+                enriched[key] = resolved
+                print(f"         ✓ Resolved mustache template in '{key}'")
+
+    # Strategy 0: Generic template replacement for <result_from_step_N> and <output from step N>
+    # Handles ALL placeholders in each string value, even when some steps failed.
+    import re
+    import json as _json
+
+    def _extract_scalar_recursive(data):
+        """Extract a representative scalar/string from a result dict."""
+        if not isinstance(data, dict):
+            return data
+        # Single-key error payload – signal failure
+        if "error" in data and len(data) == 1:
+            return None
+        for _k in ["result", "answer", "output", "value", "content"]:
+            if _k in data:
+                val = data[_k]
+                if isinstance(val, dict):
+                    return _extract_scalar_recursive(val)
+                return val
+        return data
+
+    _placeholder_pattern = r'<(?:result_from_step_|output_from_step_|output from step\s*)(\d+)>'
+
+    for _param_key, _param_value in list(enriched.items()):
+        if not isinstance(_param_value, str):
+            continue
+        _all_step_nums = re.findall(_placeholder_pattern, _param_value, re.IGNORECASE)
+        if not _all_step_nums:
+            continue
+
+        _new_value = _param_value
+        _replaced_count = 0
+        for _step_num in _all_step_nums:
+            _step_key = f"step_{_step_num}"
+            # Build a regex that matches this specific placeholder
+            _specific_pat = r'<(?:result_from_step_|output_from_step_|output from step\s*)' + _step_num + r'>'
+
+            if _step_key in step_results:
+                _raw_result = step_results[_step_key]["result"]
+                if isinstance(_raw_result, dict):
+                    _extracted = _extract_scalar_recursive(_raw_result)
+                    if _extracted is None:
+                        # Step produced an error — inject a descriptive note
+                        _replacement = f"[Step {_step_num} failed — no data available]"
+                        print(f"         ⚠️  Step {_step_num} result is an error — injecting note")
+                    else:
+                        if isinstance(_extracted, (dict, list)):
+                            _replacement = _json.dumps(_extracted)
+                        else:
+                            _replacement = str(_extracted)
+                        _replaced_count += 1
+                        print(f"         ✓ Injected extracted value from step {_step_num}")
+                else:
+                    _replacement = str(_raw_result)
+                    _replaced_count += 1
+                    print(f"         ✓ Injected result from step {_step_num}")
+            else:
+                # Step not recorded (failed before completion or not yet run)
+                _replacement = f"[Step {_step_num} did not produce results]"
+                print(f"         ⚠️  Step {_step_num} not in results — injecting note")
+
+            # Replace only the specific placeholder (escape replacement to avoid regex issues)
+            _new_value = re.sub(_specific_pat, lambda _m, r=_replacement: r, _new_value, flags=re.IGNORECASE)
+
+        if _new_value != _param_value:
+            enriched[_param_key] = _new_value
+            print(f"         ✓ Resolved {len(_all_step_nums)} placeholder(s) in '{_param_key}' ({_replaced_count} with real data)")
     
-    # Strategy 1: Use capability-specific logic
+    # Strategy 1: Generic Input Chaining
+    # This replaces specific capability checks (math, transform, etc.) with a generic heuristic.
+    # If parameters are missing but required, try to fill them from the previous step result.
+    
+    # Identify potential "chainable" input parameters
+    # These are common names for primary inputs in agent capabilities
+    primary_input_keys = ["data", "input", "value", "text", "context", "a", "base", "equation", "numbers", "code", "content"]
+    
+    # Identify which keys are present in current parameters but empty/None
+    missing_keys = [k for k in primary_input_keys if k in enriched and (enriched[k] is None or enriched[k] == "")]
+    
+    # Also check if any critical primary keys are completely missing from parameters
+    # (In a real system, we would check the agent's schema definition here)
+    # For now, we assume if specific common keys are standard for a capability, we check them
+    
+    # If we have missing inputs and previous results exist
+    if step_results:
+        # Get the most recent result (Step N-1)
+        # Sort by step number to ensure we get the last one
+        try:
+            last_key = sorted(step_results.keys(), key=lambda x: int(x.split('_')[1]))[-1]
+            last_result = step_results[last_key]["result"]
+        except Exception as e:
+             print(f"      ⚠️  Error extracting last result: {e}")
+             return enriched
+        
+        # Extract the actual value from the result structure
+        chain_value = last_result
+        
+        # Helper to extract scalar from dict
+        def extract_scalar(data):
+            if not isinstance(data, dict):
+                return data
+            
+            # Prioritize specific keys
+            for key in ["result", "answer", "output", "value", "content"]:
+                if key in data:
+                    val = data[key]
+                    # If extraction yielded another dict, recurse one level
+                    if isinstance(val, dict):
+                        return extract_scalar(val)
+                    return val
+            return data
+
+        chain_value = extract_scalar(last_result)
+        
+        # Apply Generic Chaining Rules
+        
+        # Rule 1: Fill missing primary inputs
+        for key in missing_keys:
+            if enriched[key] is None or enriched[key] == "":
+                enriched[key] = chain_value
+                print(f"         ✓ Generic Chain: Injected previous result into '{key}'")
+        
+        # Rule 2: If 'transform_data' or 'analyze_data' or 'generate_report', ensure 'data' is filled
+        if capability in ["transform_data", "analyze_data", "generate_report"] and "data" not in enriched:
+             enriched["data"] = chain_value
+             print(f"         ✓ Generic Chain: Injected previous result into 'data'")
+             
+        # Rule 3: Math specific chaining (generic fallback for numeric inputs)
+        if capability in ["calculate", "advanced_math", "solve_equation", "statistics"]:
+            # If 'value', 'a', or 'base' are missing, inject numeric values
+            target_keys = ["value", "a", "base", "numbers"]
+            for target in target_keys:
+                if target not in enriched or enriched[target] is None:
+                    # Only inject if we have a numeric-like value
+                    is_numeric = isinstance(chain_value, (int, float)) or (isinstance(chain_value, str) and chain_value.replace('.','',1).isdigit())
+                    if is_numeric:
+                        if target == "numbers" and not isinstance(chain_value, list):
+                            enriched[target] = [chain_value] # Wrap single number for statistics
+                        else:
+                            enriched[target] = chain_value
+                        print(f"         ✓ Generic Chain: Injected numeric result into '{target}'")
+                        break # Only fill one primary input per step to avoid 'a' and 'b' being same
+                        
+    # Strategy 2: Specific overrides if needed (kept minimal)
     if capability == "compare_concepts":
         # Need two concepts to compare
         if "concept_a" not in enriched or not enriched["concept_a"]:
@@ -62,29 +282,6 @@ async def enrich_with_workflow_context(
                     enriched["concept_b"] = parts[-1].strip()
                     print(f"         ✓ Injected one result + parsed concept from description")
     
-    elif capability == "generate_report":
-        # Reports often summarize previous work
-        if not enriched or "data" not in enriched:
-            # Collect all previous meaningful results
-            all_results = {
-                f"{res['capability']}_result": res['result']
-                for res in step_results.values()
-            }
-            enriched["data"] = all_results
-            enriched["context"] = step_description
-            print(f"         ✓ Injected {len(all_results)} previous results for report")
-    
-    elif capability == "transform_data":
-        if "data" not in enriched or not enriched["data"]:
-            # Use last data analysis or processing result
-            if "analyze_data" in capability_outputs:
-                enriched["data"] = capability_outputs["analyze_data"]
-                print(f"         ✓ Injected analyzed data")
-            elif step_results:
-                last_result = list(step_results.values())[-1]["result"]
-                enriched["data"] = last_result
-                print(f"         ✓ Injected last step result as data")
-    
     elif capability == "explain_code":
         if "code" not in enriched or not enriched["code"]:
             if "analyze_python_code" in capability_outputs:
@@ -92,12 +289,16 @@ async def enrich_with_workflow_context(
                 print(f"         ✓ Injected analyzed code")
     
     elif capability == "summarize_data":
-        if "data" not in enriched:
-            # Summarize all previous outputs
+        _data_val = enriched.get("data")
+        _has_unresolved = isinstance(_data_val, str) and re.search(
+            r'<(?:result_from_step_|output_from_step_|output from step\s*)\d+>', _data_val, re.IGNORECASE
+        )
+        if "data" not in enriched or _has_unresolved:
+            # Aggregate all previous step results for summarisation
             enriched["data"] = {
                 k: v["result"] for k, v in step_results.items()
             }
-            print(f"         ✓ Injected all previous step results")
+            print(f"         ✓ Injected all previous step results ({len(step_results)} steps)")
     
     elif capability == "analyze_data":
         # Check if data parameter is a placeholder or missing
@@ -223,15 +424,34 @@ async def enrich_with_workflow_context(
 # Configuration
 ORCHESTRATOR_NAME = os.getenv("ORCHESTRATOR_NAME", "MainOrchestrator")
 ORCHESTRATOR_PORT = int(os.getenv("ORCHESTRATOR_PORT", "8100"))
+ORCHESTRATOR_HOST = os.getenv("ORCHESTRATOR_HOST", "localhost")
 REGISTRY_URL = os.getenv("REGISTRY_URL", "http://localhost:8000")
 AWS_REGION = os.getenv("AWS_REGION", "eu-west-2")
 BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20241022-v2:0")
 
+# ── LLM provider selection ─────────────────────────────────────────────────
+# LLM_PROVIDER=direct   → use AWS Bedrock directly (default, existing behaviour)
+# LLM_PROVIDER=model_gateway → route all LLM calls through the Model Gateway
+#   service, which provides multi-provider routing, fallback, and audit.
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "direct").strip().lower()
+
+# Model Gateway settings (used when LLM_PROVIDER=model_gateway)
+MODEL_GATEWAY_URL = os.getenv("MODEL_GATEWAY_URL", "http://model-gateway:8400").rstrip("/")
+# Optional: hint the gateway which model family to prefer.  Leave blank to let
+# the gateway select automatically based on task type and cost tier.
+MODEL_GATEWAY_PREFERRED_MODEL = os.getenv("MODEL_GATEWAY_PREFERRED_MODEL", "").strip() or None
+# Optional: force a specific cost tier for every model gateway call.
+# Valid values: premium | standard | economy  (leave blank to let the gateway decide)
+ORCHESTRATOR_COST_TIER = os.getenv("ORCHESTRATOR_COST_TIER", "").strip() or None
+
 # Global state
 orchestrator_id = None
 registry_client = None
-bedrock_client = None
-active_workflows: Dict[str, Dict[str, Any]] = {}
+bedrock_client = None   # boto3 bedrock-runtime client; None when using model_gateway
+_gateway_http_client = None  # httpx.AsyncClient; None when using direct Bedrock
+# NOTE: active_workflows was a per-process dict and has been replaced by
+# dist_state.workflows — a shared, Redis-backed store for HA deployments.
+# All former `active_workflows[...]` usages now go through dist_state.
 
 
 async def register_with_registry():
@@ -254,10 +474,10 @@ async def register_with_registry():
             )
         ],
         has_llm=True,
-        endpoint=f"http://localhost:{ORCHESTRATOR_PORT}"
+        endpoint=f"http://{ORCHESTRATOR_HOST}:{ORCHESTRATOR_PORT}"
     )
     
-    registry_client = A2AClient(REGISTRY_URL)
+    registry_client = A2AClient(REGISTRY_URL, timeout=int(os.getenv("AGENT_TASK_TIMEOUT", "300")))
     
     try:
         response = await registry_client.register_agent(metadata)
@@ -310,17 +530,221 @@ def init_bedrock():
     print(f"✓ Bedrock client initialized (region: {AWS_REGION}, model: {BEDROCK_MODEL_ID})")
 
 
+def init_llm_client():
+    """
+    Initialise the LLM back-end selected by LLM_PROVIDER.
+
+    * LLM_PROVIDER=direct (default) — creates a boto3 bedrock-runtime client
+      exactly as before; behaviour is 100% backward-compatible.
+    * LLM_PROVIDER=model_gateway — creates an httpx.AsyncClient pointing at the
+      Model Gateway service.  All LLM calls are then routed through the gateway,
+      giving multi-provider routing, circuit-breaker fallback, and a unified
+      audit trail.  Direct Bedrock credentials are NOT required in this mode.
+    """
+    global bedrock_client, _gateway_http_client
+
+    if LLM_PROVIDER == "model_gateway":
+        import httpx
+        _gateway_http_client = httpx.AsyncClient(
+            base_url=MODEL_GATEWAY_URL,
+            timeout=120.0,
+            headers={"Content-Type": "application/json"},
+        )
+        print(f"✓ LLM provider: Model Gateway  ({MODEL_GATEWAY_URL})")
+        if MODEL_GATEWAY_PREFERRED_MODEL:
+            print(f"  preferred model hint: {MODEL_GATEWAY_PREFERRED_MODEL}")
+        return
+
+    # Default: direct Bedrock
+    init_bedrock()
+
+
+async def _llm_converse(
+    modelId: str,
+    messages: list,
+    system: list = None,
+    inferenceConfig: dict = None,
+    workflow_id: str = None,
+    session_id: str = None,
+    user_id: str = None,
+    cost_tier: str = None,
+) -> dict:
+    """
+    Unified async LLM call that dispatches to either:
+      • AWS Bedrock directly (LLM_PROVIDER=direct)
+      • Model Gateway /v1/complete (LLM_PROVIDER=model_gateway)
+
+    Always returns a dict in the Bedrock ``converse()`` response shape so that
+    all callers can read ``response['output']['message']['content'][0]['text']``
+    regardless of which back-end is active.
+    """
+    if LLM_PROVIDER == "model_gateway":
+        return await _gateway_converse(
+            messages=messages,
+            system=system,
+            inferenceConfig=inferenceConfig,
+            workflow_id=workflow_id,
+            session_id=session_id,
+            user_id=user_id,
+            cost_tier=cost_tier or ORCHESTRATOR_COST_TIER,
+        )
+
+    # Direct Bedrock — boto3 is synchronous; run in a thread to avoid
+    # blocking the asyncio event loop.
+    import asyncio
+    kwargs: dict = {"modelId": modelId, "messages": messages}
+    if system:
+        kwargs["system"] = system
+    if inferenceConfig:
+        kwargs["inferenceConfig"] = inferenceConfig
+    return await asyncio.get_event_loop().run_in_executor(
+        None, lambda: bedrock_client.converse(**kwargs)
+    )
+
+
+async def _gateway_converse(
+    messages: list,
+    system: list = None,
+    inferenceConfig: dict = None,
+    workflow_id: str = None,
+    session_id: str = None,
+    user_id: str = None,
+    cost_tier: str = None,
+) -> dict:
+    """
+    POST to Model Gateway /v1/complete and translate the response into the
+    Bedrock ``converse()`` response shape expected by the orchestrator.
+
+    Message translation:
+      Bedrock  →  {"role": "user", "content": [{"text": "..."}]}
+      Gateway  →  {"role": "user", "content": "..."}   (plain string)
+
+    System prompt:
+      Bedrock  →  system=[{"text": "..."}]
+      Gateway  →  system_prompt="..."   (plain string)
+    """
+    inference = inferenceConfig or {}
+    max_tokens = inference.get("maxTokens", 4096)
+    temperature = inference.get("temperature", 0.7)
+
+    # Flatten system blocks into a single string
+    system_prompt: str = None
+    if system:
+        system_prompt = "\n".join(
+            block.get("text", "") if isinstance(block, dict) else str(block)
+            for block in system
+        ).strip() or None
+
+    # Translate Bedrock content blocks → plain strings for the gateway
+    gw_messages = []
+    for msg in messages:
+        raw_content = msg.get("content", "")
+        if isinstance(raw_content, list):
+            # e.g. [{"text": "hello"}, {"text": " world"}]
+            text = " ".join(
+                block.get("text", "") if isinstance(block, dict) else str(block)
+                for block in raw_content
+                if not isinstance(block, dict) or "text" in block
+            )
+        else:
+            text = str(raw_content)
+        gw_messages.append({"role": msg["role"], "content": text})
+
+    payload: dict = {
+        "messages": gw_messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if system_prompt:
+        payload["system_prompt"] = system_prompt
+    if MODEL_GATEWAY_PREFERRED_MODEL:
+        payload["preferred_model"] = MODEL_GATEWAY_PREFERRED_MODEL
+    if workflow_id:
+        payload["workflow_id"] = workflow_id
+    if session_id:
+        payload["session_id"] = session_id
+    if user_id:
+        payload["user_id"] = user_id
+    if cost_tier:
+        payload["cost_tier"] = cost_tier
+
+    try:
+        resp = await _gateway_http_client.post("/v1/complete", json=payload)
+        resp.raise_for_status()
+        gw = resp.json()
+    except Exception as exc:
+        raise RuntimeError(f"Model Gateway request failed: {exc}") from exc
+
+    # Translate gateway response → Bedrock converse() shape
+    content_text = gw.get("content", "")
+    usage = gw.get("usage", {})
+    return {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [{"text": content_text}],
+            }
+        },
+        "usage": {
+            "inputTokens": usage.get("input_tokens", 0),
+            "outputTokens": usage.get("output_tokens", 0),
+        },
+        "stopReason": gw.get("finish_reason", "end_turn"),
+        # Extra metadata — available for logging/debugging; not parsed by callers
+        "_gateway_meta": {
+            "model_id": gw.get("model_id"),
+            "provider": gw.get("provider"),
+            "fallback_used": gw.get("fallback_used", False),
+            "detected_task": gw.get("detected_task"),
+            "selection_reason": gw.get("selection_reason"),
+            "request_id": gw.get("request_id"),
+            "latency_ms": gw.get("latency_ms"),
+        },
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle management"""
+    global db, interaction_mgr, executor
+    
     print("Starting Orchestrator Service...")
-    init_bedrock()
+    
+    # Initialize database and managers
+    from ha_database import get_workflow_database
+    from interaction import InteractionManager
+    from executor import WorkflowExecutor
+    
+    global db, interaction_mgr, executor
+    db = get_workflow_database()
+    interaction_mgr = InteractionManager(db)
+    executor = WorkflowExecutor(db, interaction_mgr)
+    print("✓ Database and managers initialized")
+    
+    # Start distributed state (registers instance, begins heartbeat)
+    await dist_state.startup()
+    print(f"✓ Distributed state started — backend={dist_state.backend.value} instance={dist_state.instance_id}")
+    
+    # Initialize LLM client (Bedrock direct or Model Gateway)
+    init_llm_client()
+    
+    # Register with registry
     await register_with_registry()
+    
+    # Initialize WebSocket handler
+    init_websocket_handler()
+    
     yield
+    
     print("Shutting down Orchestrator Service...")
     if registry_client and orchestrator_id:
         await registry_client.unregister_agent(orchestrator_id)
         await registry_client.close()
+    # Close Model Gateway HTTP client if it was opened
+    if _gateway_http_client:
+        await _gateway_http_client.aclose()
+    # Graceful distributed state shutdown (deregisters instance, closes connections)
+    await dist_state.shutdown()
 
 
 app = FastAPI(
@@ -329,6 +753,73 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+# Add CORS middleware for WebSocket connections
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify actual origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize WebSocket handler (will be set up after managers are available)
+# Global state
+registry_client: A2AClient = None
+orchestrator_id: str = None
+bedrock_runtime = None
+
+# Global managers (initialized in lifespan)
+db = None
+interaction_mgr = None
+executor = None
+ws_handler = None
+
+
+def init_websocket_handler():
+    """Initialize WebSocket handler with database and managers"""
+    global ws_handler, db, interaction_mgr, executor
+    from websocket_handler import WebSocketMessageHandler
+    
+    # Use the global instances created during lifespan startup
+    if not db:
+        print("⚠️  Warning: Database not initialized yet")
+        return
+    if not interaction_mgr:
+        print("⚠️  Warning: Interaction manager not initialized yet")
+        return
+    if not executor:
+        print("⚠️  Warning: Executor not initialized yet")
+        return
+    
+    # Pass the resume_workflow function to the handler
+    ws_handler = WebSocketMessageHandler(db, interaction_mgr, executor, resume_workflow_func=resume_workflow)
+
+    # HA: wrap broadcast_to_workflow so every local broadcast ALSO publishes to
+    # Redis pub/sub — other replicas subscribe and forward to their WS clients.
+    _original_broadcast = ws_handler.connection_manager.broadcast_to_workflow
+
+    async def _ha_broadcast(workflow_id: str, event: dict) -> None:
+        # Deliver to WebSocket clients connected to THIS instance directly.
+        await _original_broadcast(workflow_id, event)
+        # Fan-out to OTHER replicas via pub/sub backend.
+        # In single-instance (InMemory) mode we must NOT also publish here because
+        # subscribe_local_websocket() registered each WS client as a pub/sub
+        # subscriber that calls _local_broadcast — publishing would re-deliver
+        # every event a second time to the same connections.
+        from shared.distributed_state import InMemoryPubSubBroker
+        if not isinstance(dist_state.pubsub, InMemoryPubSubBroker):
+            await dist_state.pubsub.publish(workflow_id, event)
+
+    ws_handler.connection_manager.broadcast_to_workflow = _ha_broadcast
+    # Store the original local-only broadcast so pub/sub subscribers can forward
+    # to local WS clients WITHOUT re-publishing to pub/sub (prevents feedback loop)
+    ws_handler.connection_manager._local_broadcast = _original_broadcast
+    print("✓ WebSocket handler initialized (HA pub/sub fan-out enabled)")
+
+
+# NOTE: session_store was a per-process defaultdict. It is now backed by
+# dist_state.sessions which is Redis-backed in HA mode for cross-instance persistence.
 
 
 @app.get("/")
@@ -342,30 +833,138 @@ async def root():
 
 @app.get("/health")
 async def health():
+    active_ids = await dist_state.workflows.list_ids()
     return {
         "status": "healthy",
         "orchestrator_id": orchestrator_id,
-        "active_workflows": len(active_workflows)
+        "instance_id": dist_state.instance_id,
+        "ha_backend": dist_state.backend.value,
+        "active_workflows": len(active_ids)
     }
 
 
 @app.post("/api/workflow/execute")
-async def execute_workflow(request: Dict[str, Any]):
+async def execute_workflow(
+    request: Dict[str, Any],
+    user: UserContext = Depends(get_current_user),
+    user_headers: Dict[str, str] = Depends(get_user_headers)
+):
     """Execute a workflow using THINK-PLAN-EXECUTE-VERIFY-REFLECT pattern"""
     task_description = request.get("task_description")
     if not task_description:
         raise HTTPException(status_code=400, detail="task_description required")
     
     workflow_id = request.get("workflow_id", str(datetime.utcnow().timestamp()))
+    session_id = request.get("session_id")
+    async_mode = request.get("async", False)  # Support async execution
+    
+    # Register workflow immediately in both memory and DB
+    workflow_state = {
+        "workflow_id": workflow_id,
+        "session_id": session_id,  # Store session ID
+        "status": "initializing",
+        "task_description": task_description,
+        "start_time": datetime.utcnow().isoformat(),
+        "results": [],
+        "completed_steps": []
+    }
+    
+    if not await dist_state.workflow_exists(workflow_id):
+        await dist_state.set_workflow_state(workflow_id, workflow_state)
+        # Also save to DB for WebSocket handler
+        workflow_record = WorkflowRecord(
+            workflow_id=workflow_id,
+            task_description=task_description,
+            status=WorkflowStatus.PLANNING,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow()
+        )
+        db.save_workflow(workflow_record)  # Not async
+    
+    if async_mode:
+        # Run workflow in background task
+        async def run_workflow_with_error_handling():
+            try:
+                # Use real authenticated user context
+                await _execute_workflow_internal(workflow_id, task_description, headers=user_headers)
+            except Exception as e:
+                print(f"❌ Background workflow execution failed: {e}")
+                import traceback
+                traceback.print_exc()
+                # Update workflow status in distributed store
+                await dist_state.update_workflow_state(workflow_id, {"status": "failed", "error": str(e)})
+        
+        asyncio.create_task(run_workflow_with_error_handling())
+        return {
+            "workflow_id": workflow_id,
+            "status": "started",
+            "message": "Workflow started in background. Connect to WebSocket for updates.",
+            "websocket_url": f"/ws/workflow/{workflow_id}"
+        }
+    else:
+        # Run workflow synchronously (original behavior)
+        return await _execute_workflow_internal(workflow_id, task_description, headers=user_headers)
+
+
+async def _execute_workflow_internal(workflow_id: str, task_description: str, headers: Dict[str, str] = None):
+    """Internal workflow execution logic"""
+    headers = headers or {}
+    user_context = security_manager.get_user_context(headers)
+    user_id = user_context.user_id
     
     print(f"\n{'='*80}")
-    print(f"🚀 WORKFLOW EXECUTION STARTED")
+    print(f"🚀 WORKFLOW EXECUTION STARTED (User: {user_id})")
     print(f"{'='*80}")
+    
+    # AUDIT: Log workflow start
+    audit_logger.log_event(workflow_id, user_id, "WORKFLOW_START", {"task": task_description})
+    
+    # GUARDRAIL: Input Validation
+    is_valid, reason = guardrails.validate_input(task_description)
+    if not is_valid:
+        error_msg = f"Guardrail Blocked Input: {reason}"
+        print(f"❌ {error_msg}")
+        audit_logger.log_event(workflow_id, user_id, "GUARDRAIL_VIOLATION", {"reason": reason})
+        raise HTTPException(status_code=400, detail=error_msg)
+        
     print(f"Workflow ID: {workflow_id}")
     print(f"Task: {task_description}")
     print()
     
     execution_log = []
+    
+    # Retrieve session history from distributed store
+    workflow_state = await dist_state.get_workflow_state(workflow_id) or {}
+    session_id = workflow_state.get("session_id")
+    session_history = None
+    if session_id:
+        # Retrieve from DB instead of memory
+        session_history = db.get_session_history(session_id)
+        if session_history:
+            print(f"   📜 Found {len(session_history)} previous session interactions")
+
+        # Augment with semantically relevant long-term memories
+        if vector_memory.is_enabled:
+            semantic_memories = await vector_memory.recall(
+                query=task_description,
+                session_id=None,  # Search globally across sessions
+                top_k=5
+            )
+            if semantic_memories:
+                print(f"   🧠 Recalled {len(semantic_memories)} long-term memories via vector search")
+                # Prepend semantic memories to session history so the planner sees them
+                memory_items = [
+                    {
+                        "task": m.metadata.get("task", m.text[:120]),
+                        "result": m.metadata.get("result", ""),
+                        "timestamp": m.metadata.get("timestamp", ""),
+                        "workflow_id": m.metadata.get("workflow_id", ""),
+                        "_memory_score": round(m.score, 3),
+                        "_source": "vector_recall"
+                    }
+                    for m in semantic_memories
+                ]
+                session_history = memory_items + (session_history or [])
     
     try:
         # PHASE 1: THINK - Understand the task and available resources
@@ -377,12 +976,15 @@ async def execute_workflow(request: Dict[str, Any]):
         
         capabilities = {}
         capability_descriptions = {}
+        capability_schemas: Dict[str, Any] = {}   # input_schema per capability
         for agent in agents:
             print(f"   - {agent.name} ({agent.role.value})")
             for cap in agent.capabilities:
                 if cap.name not in capabilities:
                     capabilities[cap.name] = []
                     capability_descriptions[cap.name] = cap.description
+                    if cap.input_schema:
+                        capability_schemas[cap.name] = cap.input_schema
                 capabilities[cap.name].append({
                     "agent_id": agent.agent_id,
                     "agent_name": agent.name,
@@ -401,7 +1003,11 @@ async def execute_workflow(request: Dict[str, Any]):
         print(f"\n📋 PHASE 2: PLAN - Generating dynamic execution plan...")
         print(f"   Model: {BEDROCK_MODEL_ID}")
         
-        plan = await generate_dynamic_plan(task_description, capabilities, capability_descriptions)
+        plan = await generate_dynamic_plan(
+            task_description, capabilities, capability_descriptions,
+            session_history, capability_schemas,
+            workflow_id=workflow_id, session_id=session_id, user_id=user_id,
+        )
         
         print(f"   Generated plan with {len(plan.get('steps', []))} steps")
         print(f"   Reasoning: {plan.get('reasoning', 'N/A')[:200]}...")
@@ -430,7 +1036,9 @@ async def execute_workflow(request: Dict[str, Any]):
             "execution_log": execution_log
         }
         
-        active_workflows[workflow_id] = workflow_state
+        await dist_state.set_workflow_state(workflow_id, workflow_state)
+        # Claim ownership so other replicas know this instance is handling it
+        await dist_state.ownership.claim(workflow_id, dist_state.instance_id)
         
         # Context accumulator for cross-step data sharing
         workflow_context = {
@@ -441,6 +1049,12 @@ async def execute_workflow(request: Dict[str, Any]):
         
         for step in plan.get("steps", []):
             step_num = step.get("step_number", 0)
+            
+            # Check if workflow is paused (e.g., waiting for user input)
+            if workflow_state.get("paused", False):
+                print(f"⏸️  Workflow paused, stopping execution at step {step_num}")
+                break
+            
             capability = step.get("capability")
             parameters = step.get("parameters", {})
             description = step.get("description", "")
@@ -465,13 +1079,29 @@ async def execute_workflow(request: Dict[str, Any]):
             
             print(f"      Agent: {agent_name}")
             print(f"      Endpoint: {agent_endpoint}")
+
+            # Notify WebSocket clients: step started
+            if ws_handler and ws_handler.connection_manager.has_connections(workflow_id):
+                await ws_handler.connection_manager.broadcast_to_workflow(workflow_id, {
+                    "type": "step_started",
+                    "workflow_id": workflow_id,
+                    "step": {
+                        "step_number": step_num,
+                        "total_steps": len(plan.get('steps', [])),
+                        "capability": capability,
+                        "description": description,
+                        "agent": agent_name
+                    },
+                    "timestamp": datetime.utcnow().isoformat()
+                })
             
             # Dynamically enrich parameters with workflow context
             enriched_parameters = await enrich_with_workflow_context(
                 capability=capability,
                 parameters=parameters,
                 workflow_context=workflow_context,
-                step_description=description
+                step_description=description,
+                session_history=session_history
             )
             
             print(f"      Enriched Parameters: {json.dumps(enriched_parameters, indent=10)}")
@@ -482,10 +1112,36 @@ async def execute_workflow(request: Dict[str, Any]):
                 parameters=enriched_parameters,
                 context={
                     "workflow_id": workflow_id,
+                    "session_id": session_id,
+                    "user_id": user_id,
                     "step_number": step_num,
+                    "step_id": f"step_{step_num}",
+                    "agent_name": agent_name,
                     "total_steps": len(plan.get('steps', [])),
-                    "workflow_context": workflow_context
+                    "workflow_context": workflow_context,
+                    "user_identity": user_context # Propagate Identity
                 }
+            )
+            
+            # SECURITY: Tool Authorization (Deterministic Check)
+            if not security_manager.validate_tool_authorization(user_context.role, capability, enriched_parameters):
+                error_msg = f"Security Policy Blocked: Authorization failed for '{capability}' with params {enriched_parameters}"
+                print(f"      ❌ {error_msg}")
+                audit_logger.log_event(workflow_id, user_id, "SECURITY_VIOLATION", {"capability": capability, "params": enriched_parameters})
+                execution_log.append({
+                    "step_number": step_num,
+                    "status": "failed",
+                    "error": error_msg
+                })
+                continue
+
+            # AUDIT: Log CoT (Thought/Plan)
+            audit_logger.log_cot(
+                workflow_id, step_num, 
+                thought=f"Need to execute {capability}", 
+                plan=f"Call agent {agent_name}", 
+                observation="Pending", 
+                action=f"Invoke {capability} with {enriched_parameters}"
             )
             
             # Execute task
@@ -493,8 +1149,130 @@ async def execute_workflow(request: Dict[str, Any]):
                 print(f"      🔄 Sending task to {agent_name}...")
                 response = await registry_client.send_task(agent_endpoint, task)
                 
+                # Check if agent is requesting user input
+                if (response.status == TaskStatus.COMPLETED and 
+                    isinstance(response.result, dict) and 
+                    response.result.get("status") == "user_input_required"):
+                    
+                    interaction_req = response.result.get("interaction_request", {})
+                    
+                    print(f"      ⏸️  Step {step_num} PAUSED - Awaiting user input")
+                    print(f"      Question: {interaction_req.get('question', 'N/A')}")
+                    
+                    # Determine input type
+                    from models import InputType
+                    input_type_str = interaction_req.get("input_type", "text")
+                    if input_type_str == "single_choice":
+                        input_type = InputType.SINGLE_CHOICE
+                    elif input_type_str == "multiple_choice":
+                        input_type = InputType.MULTIPLE_CHOICE
+                    elif input_type_str == "confirmation":
+                        input_type = InputType.CONFIRMATION
+                    else:
+                        input_type = InputType.TEXT
+                    
+                    # Create interaction request via interaction manager
+                    # Merge agent context with orchestrator context
+                    merged_context = {"capability": capability, "step": step_num}
+                    agent_context = interaction_req.get("context", {})
+                    if isinstance(agent_context, dict):
+                        merged_context.update(agent_context)
+                    
+                    # Extract and validate reasoning field
+                    reasoning = interaction_req.get("reasoning", "")
+                    if not isinstance(reasoning, str):
+                        reasoning = str(reasoning) if reasoning else ""
+                    
+                    interaction_request = await interaction_mgr.request_user_input(
+                        workflow_id=workflow_id,
+                        step_id=f"step_{step_num}",
+                        agent_name=agent_name,
+                        question=interaction_req.get("question", "Additional input needed"),
+                        input_type=input_type,
+                        options=interaction_req.get("options"),
+                        context=merged_context,
+                        reasoning=reasoning
+                    )
+                    
+                    # Create interaction object matching HTML client expectations
+                    interaction = {
+                        "request_id": interaction_request.request_id,
+                        "workflow_id": workflow_id,
+                        "step_number": step_num,
+                        "agent": agent_name,
+                        "capability": capability,
+                        "question": interaction_request.question,
+                        "reasoning": interaction_request.reasoning or "",
+                        "input_type": input_type_str,
+                        "options": interaction_request.options,
+                        "placeholder": interaction_req.get("placeholder", "Enter your response...")
+                    }
+                    
+                    # Save workflow state to database
+                    db.update_workflow_state(workflow_id, {
+                        "status": "waiting_for_input",
+                        "current_step": step_num,
+                        "plan": plan,
+                        "workflow_context": workflow_context,
+                        "workflow_state": workflow_state,
+                        "pending_interaction": interaction,
+                        "agent_endpoint": agent_endpoint,
+                        "agent_name": agent_name,
+                        "original_task": task.dict() if hasattr(task, 'dict') else task
+                    })
+                    
+                    # Notify WebSocket clients: user input needed
+                    if ws_handler and ws_handler.connection_manager.has_connections(workflow_id):
+                        await ws_handler.connection_manager.broadcast_to_workflow(workflow_id, {
+                            "type": "user_input_required",
+                            "workflow_id": workflow_id,
+                            "interaction": interaction,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                    
+                    # Mark workflow as paused and break from loop
+                    workflow_state["paused"] = True
+                    workflow_state["pending_interaction"] = interaction
+                    workflow_state["pause_step"] = step_num
+                    workflow_state["agent_endpoint"] = agent_endpoint
+                    workflow_state["agent_name"] = agent_name
+                    
+                    print(f"      ⏸️  Workflow paused at step {step_num}")
+                    break  # Exit the loop
+                
                 # PHASE 4: VERIFY - Verify step execution
-                if response.status == TaskStatus.COMPLETED:
+                elif response.status == TaskStatus.COMPLETED:
+                    # Guard: some agents return HTTP 200 / COMPLETED but embed an MCP
+                    # failure inside the result payload, e.g.:
+                    #   {"result": {"error": "All connection attempts failed"}, ...}
+                    # Detect this and treat the step as genuinely failed so the error is
+                    # surfaced cleanly instead of propagating a corrupt value downstream.
+                    _r = response.result if isinstance(response.result, dict) else {}
+                    _inner_r = _r.get("result", _r)
+                    _embedded_err = _inner_r.get("error") if isinstance(_inner_r, dict) else None
+                    if _embedded_err:
+                        _err_msg = f"MCP tool error: {_embedded_err}"
+                        print(f"      ❌ Step {step_num} VERIFICATION FAILED: {_err_msg}")
+                        execution_log.append({
+                            "phase": "EXECUTE-VERIFY",
+                            "step_number": step_num,
+                            "status": "failed",
+                            "error": _err_msg
+                        })
+                        if ws_handler and ws_handler.connection_manager.has_connections(workflow_id):
+                            await ws_handler.connection_manager.broadcast_to_workflow(workflow_id, {
+                                "type": "step_failed",
+                                "workflow_id": workflow_id,
+                                "step": {
+                                    "step_number": step_num,
+                                    "capability": capability,
+                                    "description": description
+                                },
+                                "error": _err_msg,
+                                "timestamp": datetime.utcnow().isoformat()
+                            })
+                        continue  # Do NOT add to completed_steps / step_results
+
                     workflow_state["completed_steps"].append(step_num)
                     
                     result_data = {
@@ -507,6 +1285,14 @@ async def execute_workflow(request: Dict[str, Any]):
                     workflow_state["results"].append(result_data)
                     
                     # Update workflow context with result
+                    
+                    # GUARDRAIL: Output Validation (PII Redaction / Topic Filtering)
+                    if isinstance(response.result, str):
+                        is_valid_out, sanitized_result = guardrails.validate_output(response.result)
+                        if not is_valid_out:
+                            print(f"      ⚠️  Guardrail Modified Output: {sanitized_result}")
+                        response.result = sanitized_result
+                    
                     workflow_context["step_results"][f"step_{step_num}"] = {
                         "description": description,
                         "capability": capability,
@@ -517,6 +1303,15 @@ async def execute_workflow(request: Dict[str, Any]):
                     print(f"      ✅ Step {step_num} VERIFIED - Success")
                     print(f"      Result: {str(response.result)[:200]}...")
                     
+                    # AUDIT: Log Observation
+                    audit_logger.log_cot(
+                        workflow_id, step_num, 
+                        thought="Execution completed", 
+                        plan="Verify result", 
+                        observation=str(response.result)[:500], 
+                        action="Proceed to next step"
+                    )
+                    
                     execution_log.append({
                         "phase": "EXECUTE-VERIFY",
                         "step_number": step_num,
@@ -525,6 +1320,22 @@ async def execute_workflow(request: Dict[str, Any]):
                         "capability": capability,
                         "result_preview": str(response.result)[:100]
                     })
+                    
+                    # Notify WebSocket clients: step completed
+                    if ws_handler and ws_handler.connection_manager.has_connections(workflow_id):
+                        await ws_handler.connection_manager.broadcast_to_workflow(workflow_id, {
+                            "type": "step_completed",
+                            "workflow_id": workflow_id,
+                            "step": {
+                                "step_number": step_num,
+                                "capability": capability,
+                                "description": description,
+                                "agent": agent_name,
+                                "status": "completed"
+                            },
+                            "result": response.result,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
                 else:
                     print(f"      ❌ Step {step_num} VERIFICATION FAILED: {response.error}")
                     execution_log.append({
@@ -533,6 +1344,20 @@ async def execute_workflow(request: Dict[str, Any]):
                         "status": "failed",
                         "error": response.error
                     })
+                    
+                    # Notify WebSocket clients: step failed
+                    if ws_handler and ws_handler.connection_manager.has_connections(workflow_id):
+                        await ws_handler.connection_manager.broadcast_to_workflow(workflow_id, {
+                            "type": "step_failed",
+                            "workflow_id": workflow_id,
+                            "step": {
+                                "step_number": step_num,
+                                "capability": capability,
+                                "description": description
+                            },
+                            "error": response.error,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
                     # Continue with remaining steps instead of breaking
                     
             except Exception as e:
@@ -543,7 +1368,34 @@ async def execute_workflow(request: Dict[str, Any]):
                     "status": "error",
                     "error": str(e)
                 })
+                
+                # Notify WebSocket clients: step error
+                if ws_handler and ws_handler.connection_manager.has_connections(workflow_id):
+                    await ws_handler.connection_manager.broadcast_to_workflow(workflow_id, {
+                        "type": "step_error",
+                        "workflow_id": workflow_id,
+                        "step": {
+                            "step_number": step_num,
+                            "capability": capability,
+                            "description": description
+                        },
+                        "error": str(e),
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
                 # Continue with remaining steps
+        
+        # Check if workflow was paused for user input
+        if workflow_state.get("paused", False):
+            return {
+                "workflow_id": workflow_id,
+                "status": "waiting_for_input",
+                "request_id": workflow_state["pending_interaction"]["request_id"],
+                "message": "Workflow paused - awaiting user input",
+                "interaction": workflow_state["pending_interaction"],
+                "steps_completed": len(workflow_state["completed_steps"]),
+                "current_step": workflow_state["pause_step"],
+                "total_steps": len(plan.get('steps', []))
+            }
         
         # PHASE 5: REFLECT - Analyze execution and results
         print(f"\n🤔 PHASE 5: REFLECT - Analyzing execution...")
@@ -553,7 +1405,10 @@ async def execute_workflow(request: Dict[str, Any]):
             plan=plan,
             workflow_context=workflow_context,
             completed_steps=len(workflow_state["completed_steps"]),
-            total_steps=len(plan.get('steps', []))
+            total_steps=len(plan.get('steps', [])),
+            workflow_id=workflow_id,
+            session_id=session_id,
+            user_id=user_id,
         )
         
         print(f"   Reflection: {reflection.get('summary', 'N/A')}")
@@ -572,7 +1427,7 @@ async def execute_workflow(request: Dict[str, Any]):
         print(f"Success rate: {reflection.get('success_rate', 'N/A')}")
         print()
         
-        return {
+        result = {
             "workflow_id": workflow_id,
             "status": "completed",
             "steps_completed": len(workflow_state["completed_steps"]),
@@ -584,6 +1439,20 @@ async def execute_workflow(request: Dict[str, Any]):
             "plan": plan
         }
         
+        # Notify WebSocket clients: workflow completed
+        if ws_handler and ws_handler.connection_manager.has_connections(workflow_id):
+            await ws_handler.connection_manager.broadcast_to_workflow(workflow_id, {
+                "type": "workflow_completed",
+                "workflow_id": workflow_id,
+                "status": "completed",
+                "steps_completed": len(workflow_state["completed_steps"]),
+                "total_steps": len(plan.get("steps", [])),
+                "result": result,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+        
+        return result
+        
     except Exception as e:
         print(f"\n❌ WORKFLOW EXECUTION FAILED: {str(e)}")
         import traceback
@@ -591,113 +1460,699 @@ async def execute_workflow(request: Dict[str, Any]):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+async def resume_workflow(workflow_id: str) -> Dict[str, Any]:
+    """
+    Resume a paused workflow after receiving user input.
+    Continues execution from the paused step with user response injected into context.
+    """
+    global db, interaction_mgr, registry_client, ws_handler
+    
+    try:
+        print(f"\n🔄 RESUMING WORKFLOW: {workflow_id}")
+        
+        # 1. Load workflow state from database
+        workflow_record = db.get_workflow(workflow_id)
+        if not workflow_record:
+            raise HTTPException(404, "Workflow not found")
+        
+        if workflow_record.status != WorkflowStatus.WAITING_FOR_INPUT:
+            raise HTTPException(400, f"Workflow not paused (status: {workflow_record.status.value})")
+        
+        # 2. Get answered interaction request (user has already responded)
+        interaction_request = interaction_mgr.get_answered_request(workflow_id)
+        if not interaction_request:
+            raise HTTPException(400, "No answered interaction request found for this workflow")
+        
+        print(f"   User response: {interaction_request.response}")
+        
+        # 3. Mark interaction as completed
+        interaction_mgr.complete_interaction(interaction_request.request_id)
+        
+        # 4. Load saved workflow state
+        # The plan is stored in workflow_context, not execution_plan
+        if workflow_record.execution_plan and 'steps' in workflow_record.execution_plan:
+            plan = workflow_record.execution_plan
+        elif workflow_record.workflow_context and 'plan' in workflow_record.workflow_context:
+            plan = workflow_record.workflow_context['plan']
+        else:
+            raise HTTPException(500, "No execution plan found in workflow record")
+        
+        # workflow_record.workflow_context contains the FULL state_data that was saved
+        # We need to extract the ACTUAL workflow_context from inside it
+        saved_state = workflow_record.workflow_context
+        workflow_context = saved_state.get("workflow_context", {})
+        workflow_state = saved_state.get("workflow_state", {})
+        
+        # If workflow_context is still empty, try workflow_record.workflow_state
+        if not workflow_context:
+            workflow_context = {}
+        if not workflow_state and workflow_record.workflow_state:
+            workflow_state = workflow_record.workflow_state
+        
+        # Ensure required context structures exist
+        if "step_results" not in workflow_context:
+            workflow_context["step_results"] = {}
+        if "capability_outputs" not in workflow_context:
+            workflow_context["capability_outputs"] = {}
+        
+        print(f"   📊 Loaded context: {len(workflow_context.get('step_results', {}))} step results, {len(workflow_context.get('capability_outputs', {}))} outputs")
+        
+        # Get the actual pause step from workflow_state
+        pause_step = (workflow_state.get("pause_step") or 
+                     saved_state.get("current_step") or 
+                     workflow_record.current_step)
+        
+        if not pause_step or pause_step == 0:
+            raise HTTPException(500, f"Could not determine paused step (pause_step={pause_step})")
+        
+        # Try to get agent info from multiple locations
+        agent_endpoint = (workflow_state.get("agent_endpoint") or 
+                         saved_state.get("agent_endpoint"))
+        agent_name = (workflow_state.get("agent_name") or 
+                     saved_state.get("agent_name"))
+        
+        if not agent_endpoint or not agent_name:
+            raise HTTPException(500, f"Agent information not found in workflow state (endpoint={agent_endpoint}, name={agent_name})")
+        
+        original_task = workflow_record.task_description
+        
+        # 5. Inject user response into workflow context
+        user_response_key = f"user_response_step_{pause_step}"
+        workflow_context[user_response_key] = interaction_request.response
+        
+        # Ensure required context structures exist
+        if "capability_outputs" not in workflow_context:
+            workflow_context["capability_outputs"] = {}
+        if "step_results" not in workflow_context:
+            workflow_context["step_results"] = {}
+            
+        workflow_context["capability_outputs"][f"user_input_{pause_step}"] = interaction_request.response
+        
+        print(f"   ✓ Injected user response into context as '{user_response_key}'")
+        
+        # 6. Re-execute the paused step with user input
+        step = plan['steps'][pause_step - 1]  # Steps are 1-indexed
+        capability = step.get("capability")
+        parameters = step.get("parameters", {})
+        description = step.get("description", "")
+        
+        print(f"\n   📌 Re-executing Step {pause_step}/{len(plan['steps'])}: {description}")
+        print(f"      Capability: {capability}")
+        
+        # Enrich parameters with user response
+        enriched_parameters = await enrich_with_workflow_context(
+            capability=capability,
+            parameters=parameters,
+            workflow_context=workflow_context,
+            step_description=description
+        )
+        
+        # Add user response explicitly if not already enriched
+        if "user_input" not in enriched_parameters and interaction_request.response:
+            enriched_parameters["user_input"] = interaction_request.response
+        
+        print(f"      Enriched Parameters: {json.dumps(enriched_parameters, indent=10)}")
+        
+        # Create task with user response in context
+        # Build user_responses list for agent's InteractionHelper.
+        # Include ALL previous answered Q&A turns for this step so multi-turn
+        # agents (e.g. asking for 'a', then 'b') can see the full history.
+        previous_turns = interaction_mgr.get_all_answered_for_step(
+            workflow_id, f"step_{pause_step}"
+        )
+        user_responses_list = [
+            {
+                "content": r.response,
+                "value": r.response,
+                "request_id": r.request_id,
+                "question": r.question,
+                "step": pause_step
+            }
+            for r in previous_turns
+        ]
+        # The current interaction may already be in previous_turns if it was
+        # marked 'completed' by complete_interaction() above; add it only if not.
+        current_ids = {r.request_id for r in previous_turns}
+        if interaction_request.request_id not in current_ids:
+            user_responses_list.append({
+                "content": interaction_request.response,
+                "value": interaction_request.response,
+                "request_id": interaction_request.request_id,
+                "question": interaction_request.question,
+                "step": pause_step
+            })
+        
+        task = TaskRequest(
+            capability=capability,
+            parameters=enriched_parameters,
+            context={
+                "workflow_id": workflow_id,
+                "session_id": workflow_state.get("session_id"),
+                "user_id": workflow_context.get("user_id"),
+                "step_number": pause_step,
+                "step_id": f"step_{pause_step}",
+                "agent_name": agent_name,
+                "total_steps": len(plan['steps']),
+                "workflow_context": workflow_context,
+                "user_response": interaction_request.response,  # Keep for backwards compatibility
+                "user_responses": user_responses_list,  # New format for AgentInteractionHelper
+                "resuming_from_pause": True,
+                "original_task": original_task,
+                "previous_interactions": [
+                    {
+                        "question": interaction_request.question,
+                        "response": interaction_request.response,
+                        "step": pause_step
+                    }
+                ],
+                "previous_step_results": workflow_context.get("step_results", {}),
+                "step_results": workflow_context.get("step_results", {}),
+                "capability_outputs": workflow_context.get("capability_outputs", {})
+            }
+        )
+        
+        # 7. Execute the step with user input
+        print(f"      🔄 Re-sending task to {agent_name} with user input...")
+        print(f"      📦 Context includes:")
+        print(f"         - Original task: {original_task[:50]}...")
+        print(f"         - User response: {interaction_request.response}")
+        print(f"         - Step results: {list(workflow_context.get('step_results', {}).keys())}")
+        print(f"         - Previous outputs: {list(workflow_context.get('capability_outputs', {}).keys())}")
+        response = await registry_client.send_task(agent_endpoint, task)
+        
+        # 8. Check if it completed or needs more input
+        if response.status == TaskStatus.COMPLETED and \
+           isinstance(response.result, dict) and \
+           response.result.get("status") == "user_input_required":
+            # Agent needs MORE input - pause again
+            print(f"      ⏸️  Agent needs additional input, pausing again...")
+            return await _handle_additional_input_request(
+                workflow_id, pause_step, response.result, 
+                agent_name, agent_endpoint, plan, workflow_context, workflow_state
+            )
+        
+        elif response.status == TaskStatus.COMPLETED:
+            # Step completed successfully!
+            print(f"      ✅ Step {pause_step} completed with user input")
+            
+            # Update workflow context
+            workflow_context["step_results"][f"step_{pause_step}"] = {
+                "description": description,
+                "capability": capability,
+                "result": response.result
+            }
+            workflow_context["capability_outputs"][capability] = response.result
+            
+            workflow_state["completed_steps"].append(pause_step)
+            workflow_state["results"].append({
+                "step": pause_step,
+                "capability": capability,
+                "agent": agent_name,
+                "result": response.result,
+                "description": description
+            })
+            
+            # Unpause workflow
+            workflow_state["paused"] = False
+            workflow_state.pop("pending_interaction", None)
+            workflow_state.pop("pause_step", None)
+            
+            # Notify WebSocket clients
+            if ws_handler and ws_handler.connection_manager.has_connections(workflow_id):
+                await ws_handler.connection_manager.broadcast_to_workflow(workflow_id, {
+                    "type": "step_completed",
+                    "workflow_id": workflow_id,
+                    "step": {
+                        "step_number": pause_step,
+                        "capability": capability,
+                        "description": description
+                    },
+                    "result": response.result,
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+            
+            # 9. Continue with remaining steps
+            print(f"\n   ▶️  Continuing with remaining steps...")
+            
+            # Get agent capabilities once for all remaining steps
+            # TODO: Consider storing agent assignments in workflow_state to avoid registry queries
+            print(f"      🔍 Discovering available agents...")
+            agents = await registry_client.get_all_agents()
+            capabilities = {}
+            for agent in agents:
+                for cap in agent.capabilities:
+                    if cap.name not in capabilities:
+                        capabilities[cap.name] = []
+                    capabilities[cap.name].append({
+                        "agent_id": agent.agent_id,
+                        "agent_name": agent.name,
+                        "endpoint": agent.endpoint,
+                        "description": cap.description
+                    })
+            print(f"      ✓ Found {len(capabilities)} capabilities from {len(agents)} agents")
+            
+            remaining_steps = plan['steps'][pause_step:]  # Continue from next step
+            
+            for step in remaining_steps:
+                step_num = step.get("step_number", 0)
+                
+                # Check pause flag
+                if workflow_state.get("paused", False):
+                    print(f"⏸️  Workflow paused again at step {step_num}")
+                    break
+                
+                capability = step.get("capability")
+                parameters = step.get("parameters", {})
+                description = step.get("description", "")
+                
+                print(f"\n   📌 Step {step_num}/{len(plan['steps'])}: {description}")
+                print(f"      Capability: {capability}")
+                
+                # Find agent for this capability (using cached capabilities)
+                if capability not in capabilities:
+                    print(f"      ❌ No agent found for capability: {capability}")
+                    continue
+                
+                agent_info = capabilities[capability][0]
+                agent_endpoint = agent_info["endpoint"]
+                agent_name = agent_info["agent_name"]
+                
+                # Enrich parameters
+                enriched_parameters = await enrich_with_workflow_context(
+                    capability=capability,
+                    parameters=parameters,
+                    workflow_context=workflow_context,
+                    step_description=description
+                )
+                
+                # Create and execute task
+                task = TaskRequest(
+                    capability=capability,
+                    parameters=enriched_parameters,
+                    context={
+                        "workflow_id": workflow_id,
+                        "session_id": workflow_state.get("session_id"),
+                        "user_id": workflow_context.get("user_id"),
+                        "step_number": step_num,
+                        "step_id": f"step_{step_num}",
+                        "agent_name": agent_name,
+                        "total_steps": len(plan['steps']),
+                        "workflow_context": workflow_context
+                    }
+                )
+                
+                print(f"      🔄 Sending task to {agent_name}...")
+                response = await registry_client.send_task(agent_endpoint, task)
+                
+                # Check for user input request
+                if response.status == TaskStatus.COMPLETED and \
+                   isinstance(response.result, dict) and \
+                   response.result.get("status") == "user_input_required":
+                    return await _handle_additional_input_request(
+                        workflow_id, step_num, response.result,
+                        agent_name, agent_endpoint, plan, workflow_context, workflow_state
+                    )
+                
+                elif response.status == TaskStatus.COMPLETED:
+                    # Update context
+                    workflow_context["step_results"][f"step_{step_num}"] = {
+                        "description": description,
+                        "capability": capability,
+                        "result": response.result
+                    }
+                    workflow_context["capability_outputs"][capability] = response.result
+                    
+                    workflow_state["completed_steps"].append(step_num)
+                    workflow_state["results"].append({
+                        "step": step_num,
+                        "capability": capability,
+                        "agent": agent_name,
+                        "result": response.result,
+                        "description": description
+                    })
+                    
+                    print(f"      ✅ Step {step_num} completed")
+                    
+                    # Notify WebSocket
+                    if ws_handler and ws_handler.connection_manager.has_connections(workflow_id):
+                        await ws_handler.connection_manager.broadcast_to_workflow(workflow_id, {
+                            "type": "step_completed",
+                            "workflow_id": workflow_id,
+                            "step": {
+                                "step_number": step_num,
+                                "capability": capability,
+                                "description": description
+                            },
+                            "result": response.result,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+            
+            # Check if workflow paused again or completed
+            if workflow_state.get("paused", False):
+                # Save state and return pause status
+                db.update_workflow_state(workflow_id, {
+                    "status": "waiting_for_input",
+                    "plan": plan,
+                    "workflow_context": workflow_context,
+                    "workflow_state": workflow_state,
+                    "current_step": workflow_state["pause_step"]
+                })
+                
+                return {
+                    "workflow_id": workflow_id,
+                    "status": "waiting_for_input",
+                    "message": "Workflow paused again - awaiting additional input",
+                    "interaction": workflow_state["pending_interaction"],
+                    "steps_completed": len(workflow_state["completed_steps"]),
+                    "total_steps": len(plan['steps'])
+                }
+            
+            # Workflow completed!
+            print(f"\n✅ WORKFLOW COMPLETED")
+            workflow_state["status"] = "completed"
+            workflow_state["end_time"] = datetime.utcnow().isoformat()
+            
+            # Update database
+            db.update_workflow_state(workflow_id, {
+                "status": "completed",
+                "plan": plan,
+                "workflow_context": workflow_context,
+                "workflow_state": workflow_state
+            })
+            
+            # Generate reflection
+            reflection = await generate_reflection(
+                task_description=workflow_context["original_task"],
+                plan=plan,
+                workflow_context=workflow_context,
+                completed_steps=len(workflow_state["completed_steps"]),
+                total_steps=len(plan['steps']),
+                workflow_id=workflow_id,
+                session_id=workflow_state.get("session_id"),
+                user_id=workflow_context.get("user_id"),
+            )
+            
+            result = {
+                "workflow_id": workflow_id,
+                "status": "completed",
+                "steps_completed": len(workflow_state["completed_steps"]),
+                "total_steps": len(plan['steps']),
+                "results": workflow_state["results"],
+                "workflow_context": workflow_context,
+                "reflection": reflection,
+                "success_rate": f"{len(workflow_state['completed_steps'])}/{len(plan['steps'])}"
+            }
+            
+            # Save to session history if session_id exists
+            if session_id:
+                # Extract main result/summary
+                final_output = ""
+                # Try to get the result of the last step or report
+                if workflow_state["results"]:
+                    last_result = workflow_state["results"][-1]["result"]
+                    if isinstance(last_result, dict) and "answer" in last_result:
+                        final_output = last_result["answer"]
+                    elif isinstance(last_result, dict) and "report" in last_result:
+                         final_output = last_result["report"]
+                    else:
+                        final_output = str(last_result)
+                
+                history_item = {
+                    "task": task_description,
+                    "result": final_output,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "workflow_id": workflow_id
+                }
+                db.save_session_history(session_id, history_item)
+
+                # Store in vector memory for long-term semantic recall
+                if vector_memory.is_enabled:
+                    await vector_memory.remember(
+                        session_id=session_id,
+                        text=f"Task: {task_description}\nResult: {final_output[:500]}",
+                        metadata={
+                            "task": task_description,
+                            "result": final_output[:1000],
+                            "result_summary": final_output[:400],
+                            "workflow_id": workflow_id,
+                            "timestamp": datetime.utcnow().isoformat()
+                        }
+                    )
+                    print(f"   🧠 Stored workflow result in vector memory")
+                
+                # Get count for logging
+                hist = db.get_session_history(session_id)
+                print(f"   💾 Saved workflow result to session history ({len(hist)} items)")
+
+            # Notify WebSocket
+            if ws_handler and ws_handler.connection_manager.has_connections(workflow_id):
+                await ws_handler.connection_manager.broadcast_to_workflow(workflow_id, {
+                    "type": "workflow_completed",
+                    "workflow_id": workflow_id,
+                    "status": "completed",
+                    "steps_completed": len(workflow_state["completed_steps"]),
+                    "total_steps": len(plan['steps']),
+                    "result": result,
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+            
+            return result
+        
+        else:
+            # Step failed
+            print(f"      ❌ Step {pause_step} failed: {response.error}")
+            raise HTTPException(500, f"Step failed after user input: {response.error}")
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error resuming workflow: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Failed to resume workflow: {str(e)}")
+
+
+async def _handle_additional_input_request(
+    workflow_id: str, step_num: int, interaction_data: dict,
+    agent_name: str, agent_endpoint: str, plan: dict,
+    workflow_context: dict, workflow_state: dict
+) -> Dict[str, Any]:
+    """Helper function to handle when agent requests additional input"""
+    global interaction_mgr, db, ws_handler
+    
+    interaction_req = interaction_data.get("interaction_request", {})
+    
+    print(f"      ⏸️  Agent requesting additional input")
+    print(f"      Question: {interaction_req.get('question', 'N/A')}")
+    
+    # Determine input type
+    from models import InputType
+    input_type_str = interaction_req.get("input_type", "text")
+    if input_type_str == "single_choice":
+        input_type = InputType.SINGLE_CHOICE
+    elif input_type_str == "multiple_choice":
+        input_type = InputType.MULTIPLE_CHOICE
+    elif input_type_str == "confirmation":
+        input_type = InputType.CONFIRMATION
+    else:
+        input_type = InputType.TEXT
+    
+    # Create interaction request
+    merged_context = {"capability": plan['steps'][step_num-1].get("capability"), "step": step_num}
+    agent_context = interaction_req.get("context", {})
+    if isinstance(agent_context, dict):
+        merged_context.update(agent_context)
+    
+    reasoning = interaction_req.get("reasoning", "")
+    if not isinstance(reasoning, str):
+        reasoning = str(reasoning) if reasoning else ""
+    
+    interaction_request = await interaction_mgr.request_user_input(
+        workflow_id=workflow_id,
+        step_id=f"step_{step_num}",
+        agent_name=agent_name,
+        question=interaction_req.get("question", "Additional input needed"),
+        input_type=input_type,
+        options=interaction_req.get("options"),
+        context=merged_context,
+        reasoning=reasoning
+    )
+    
+    # Create interaction object
+    interaction = {
+        "request_id": interaction_request.request_id,
+        "workflow_id": workflow_id,
+        "step_number": step_num,
+        "agent": agent_name,
+        "capability": plan['steps'][step_num-1].get("capability"),
+        "question": interaction_request.question,
+        "reasoning": interaction_request.reasoning or "",
+        "input_type": input_type_str,
+        "options": interaction_request.options,
+        "placeholder": interaction_req.get("placeholder", "Enter your response...")
+    }
+    
+    # Save workflow state
+    db.update_workflow_state(workflow_id, {
+        "status": "waiting_for_input",
+        "current_step": step_num,
+        "plan": plan,
+        "workflow_context": workflow_context,
+        "workflow_state": workflow_state,
+        "pending_interaction": interaction,
+        "agent_endpoint": agent_endpoint,
+        "agent_name": agent_name
+    })
+    
+    # Notify WebSocket clients
+    if ws_handler and ws_handler.connection_manager.has_connections(workflow_id):
+        await ws_handler.connection_manager.broadcast_to_workflow(workflow_id, {
+            "type": "user_input_required",
+            "workflow_id": workflow_id,
+            "interaction": interaction,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    
+    # Mark workflow as paused
+    workflow_state["paused"] = True
+    workflow_state["pending_interaction"] = interaction
+    workflow_state["pause_step"] = step_num
+    workflow_state["agent_endpoint"] = agent_endpoint
+    workflow_state["agent_name"] = agent_name
+    
+    return {
+        "workflow_id": workflow_id,
+        "status": "waiting_for_input",
+        "request_id": interaction["request_id"],
+        "message": "Workflow paused - awaiting user input",
+        "interaction": interaction,
+        "steps_completed": len(workflow_state["completed_steps"]),
+        "current_step": step_num,
+        "total_steps": len(plan['steps'])
+    }
+
+
 async def generate_dynamic_plan(
     task_description: str,
     capabilities: Dict[str, List[Dict]],
-    capability_descriptions: Dict[str, str]
+    capability_descriptions: Dict[str, str],
+    session_history: List[Dict] = None,
+    capability_schemas: Dict[str, Any] = None,
+    workflow_id: str = None,
+    session_id: str = None,
+    user_id: str = None,
 ) -> Dict[str, Any]:
     """
-    Generate dynamic execution plan using LLM with full capability context.
-    Uses THINK-PLAN pattern to create optimal workflow.
+    Generate a dynamic execution plan using the LLM.
+    All routing decisions are driven by the live registry data (capability
+    descriptions + input_schema) — no hardcoded routing logic here.
     """
-    
+    capability_schemas = capability_schemas or {}
     capabilities_list = list(capabilities.keys())
-    
-    # Build detailed capability descriptions with context
-    capabilities_details = []
-    for cap_name, agents in capabilities.items():
-        agent_info = agents[0]  # First agent providing this capability
-        description = capability_descriptions.get(cap_name, "No description")
-        capabilities_details.append(
-            f"- {cap_name}: {description} (Agent: {agent_info['agent_name']})"
-        )
-    
-    capabilities_str = "\n".join(capabilities_details)
-    
-    prompt = f"""You are an intelligent task orchestrator. Analyze the user's task and create a detailed step-by-step execution plan.
 
-USER TASK:
-{task_description}
+    # ── Session history ─────────────────────────────────────────────────
+    history_str = ""
+    if session_history:
+        history_str = "\nPREVIOUS CONVERSATION HISTORY (use as context if relevant):\n"
+        for i, entry in enumerate(session_history[-5:]):
+            history_str += f"Turn {i+1} Task: {entry['task']}\n"
+            result_preview = str(entry['result'])
+            if len(result_preview) > 800:
+                result_preview = result_preview[:800] + "...(truncated)"
+            history_str += f"Turn {i+1} Result: {result_preview}\n\n"
 
-AVAILABLE CAPABILITIES:
-{capabilities_str}
+    # ── Build capability documentation dynamically from registry data ────
+    # Each capability self-describes its parameters and usage via input_schema
+    # registered by the agent at startup — nothing is hardcoded here.
+    def _build_cap_doc(cap_name: str) -> str:
+        agents_for_cap = capabilities.get(cap_name, [])
+        agent_name = agents_for_cap[0]["agent_name"] if agents_for_cap else "Unknown"
+        description = capability_descriptions.get(cap_name, "")
+        schema = capability_schemas.get(cap_name, {})
+        lines = [f"- {cap_name} (handled by: {agent_name})"]
+        lines.append(f"  Description: {description}")
+        params = schema.get("parameters", {})
+        if params:
+            param_parts = []
+            for pname, pmeta in params.items():
+                req = "REQUIRED" if pmeta.get("required") else "optional"
+                ptype = pmeta.get("type", "any")
+                pdesc = pmeta.get("description", "")
+                enum_vals = pmeta.get("enum")
+                enum_str = f" — one of {enum_vals}" if enum_vals else ""
+                param_parts.append(f"    {pname} ({req}, {ptype}{enum_str}): {pdesc}")
+            lines.append("  Parameters:")
+            lines.extend(param_parts)
+        example = schema.get("example")
+        if example:
+            lines.append(f"  Usage example: {json.dumps(example)}")
+        step_ref = schema.get("step_reference")
+        if step_ref:
+            lines.append(f"  Note: {step_ref}")
+        return "\n".join(lines)
 
-INSTRUCTIONS:
-1. Break down the task into specific, atomic steps
-2. Each step should use ONE capability from the available list
-3. Steps should build on each other logically
-4. If the task mentions "then" or "and", treat those as separate steps
-5. For comparison tasks, first research each concept separately, THEN compare them
-6. For report generation, gather all required data first, THEN generate the report
+    capability_docs = "\n\n".join(_build_cap_doc(c) for c in capabilities_list)
 
-EXAMPLES:
+    # ── Assemble planning prompt ─────────────────────────────────────────
+    system_instruction = """\
+You are an intelligent task orchestrator. Your job is to produce an optimal step-by-step \
+execution plan for the user's task using ONLY the capabilities listed below.
 
-Example 1 - Math: "Calculate the sum of 25 and 17, then square the result"
-Step 1: Use "calculate" with {{"operation": "add", "a": 25, "b": 17}}
-Step 2: Use "advanced_math" with {{"operation": "power", "value": "<result_from_step_1>", "exponent": 2}}
+RULES:
+1. Use ONLY capabilities from the list. Never invent capability names.
+2. Choose the capability whose description BEST matches what that step needs to accomplish. \
+   Read each capability description carefully — they explicitly state what they should and \
+   should not be used for.
+3. Each step uses exactly ONE capability. Steps should chain logically.
+4. Decompose compound tasks (joined by "then", "and then", "after") into separate steps.
+5. When a step's input depends on an earlier step's output, reference it as \
+   <result_from_step_N> in the parameter value (e.g. <result_from_step_1>).
+6. For comparison workflows: research each concept first (separate steps), then compare.
+7. For report workflows: gather all data first, then generate the report.
+8. Set parameters to empty string / empty list when the orchestrator will inject prior \
+   step results (this is noted in each capability's description).
+9. Return ONLY valid JSON — no markdown, no code fences, no extra text.
+10. REAL-TIME DATA RULE (MANDATORY): If the task asks for ANY real-time or live information \
+    — current time, today's date, live prices, current weather, recent news, sports scores, \
+    or anything an LLM cannot know without internet access — you MUST use `search_web` \
+    (if available in the list), NOT `answer_question`. This rule overrides all other routing \
+    considerations for such queries.
 
-Example 2 - Research: "Research X, then research Y, and create a comparison report"
-Step 1: Use "answer_question" to research X
-Step 2: Use "answer_question" to research Y  
-Step 3: Use "compare_concepts" to compare X and Y (leave concept_a and concept_b empty - orchestrator will inject research results)
-Step 4: Use "generate_report" to create final report (leave data empty - orchestrator will inject comparison results)
-
-CAPABILITY USAGE:
-- calculate: For basic math operations (add, subtract, multiply, divide)
-  Required parameters: {{"operation": "add|subtract|multiply|divide", "a": number, "b": number}}
-  Example: {{"operation": "add", "a": 25, "b": 17}}
-  
-- advanced_math: For advanced operations (power, sqrt, sin, cos, etc)
-  Required parameters: {{"operation": "power|sqrt|sin|cos|tan", "value": number, "exponent": number (for power)}}
-  Example for squaring: {{"operation": "power", "value": 42, "exponent": 2}}
-  
-- solve_equation: For solving equations
-  Parameters: {{"equation": "equation string"}}
-  
-- statistics: For statistical calculations
-  Parameters: {{"operation": "mean|median|std_dev", "values": [numbers]}}
-
-- answer_question: For research, questions, information gathering
-  Required parameters: {{"question": "specific question to answer"}}
-  
-- compare_concepts: For comparing two things
-  Parameters: {{"concept_a": "", "concept_b": ""}} (leave empty if previous steps provide data)
-  
-- generate_report: For creating formatted reports
-  Parameters: {{"topic": "report subject", "data": ""}} (data can be empty if previous steps provide it)
-
-- analyze_data: For data analysis
-  Parameters: {{"data": "data to analyze"}}
-
-- analyze_python_code: For code analysis
-  Parameters: {{"code": "python code"}}
-
-RESPONSE FORMAT (return ONLY this JSON, no other text):
-{{
+RESPONSE FORMAT:
+{
   "steps": [
-    {{
+    {
       "step_number": 1,
       "capability": "capability_name",
       "description": "Clear description of what this step does",
-      "parameters": {{"key": "value"}},
+      "parameters": {"key": "value"},
       "expected_output": "What this step produces",
       "depends_on": []
-    }}
+    }
   ],
-  "reasoning": "Explain why you chose this plan structure"
-}}
+  "reasoning": "Brief explanation of why this plan structure was chosen"
+}"""
 
-Return ONLY the JSON object. No markdown formatting, no code blocks, no explanations outside the JSON.
-"""
-    
-    print(f"   Calling Bedrock with model: {BEDROCK_MODEL_ID}")
+    user_message = f"USER TASK:\n{task_description}\n"
+    if history_str:
+        user_message += history_str
+    user_message += f"\nAVAILABLE CAPABILITIES (registered by live agents):\n\n{capability_docs}\n\nGenerate the execution plan JSON."
+
+    provider_label = "Model Gateway" if LLM_PROVIDER == "model_gateway" else "Bedrock"
+    print(f"   Calling {provider_label} with model: {BEDROCK_MODEL_ID}")
     print(f"   Temperature: 0.1 (low for structured output)")
-    
+    if session_history:
+        print(f"   Generating plan with {len(session_history)} history items")
+
     try:
-        response = bedrock_client.converse(
+        response = await _llm_converse(
             modelId=BEDROCK_MODEL_ID,
-            messages=[{"role": "user", "content": [{"text": prompt}]}],
-            inferenceConfig={"maxTokens": 4000, "temperature": 0.1}
+            system=[{"text": system_instruction}],
+            messages=[{"role": "user", "content": [{"text": user_message}]}],
+            inferenceConfig={"maxTokens": 4000, "temperature": 0.1},
+            workflow_id=workflow_id,
+            session_id=session_id,
+            user_id=user_id,
         )
         
         content = response['output']['message']['content'][0]['text']
@@ -727,7 +2182,21 @@ Return ONLY the JSON object. No markdown formatting, no code blocks, no explanat
         
         try:
             plan = json.loads(content)
-            
+
+            # Normalise nested {"plan": {"steps": [...]}} structure that some
+            # LLM responses return instead of the expected top-level {"steps": [...]}
+            if "plan" in plan and isinstance(plan["plan"], dict):
+                inner = plan["plan"]
+                plan = {
+                    "steps": inner.get("steps", []),
+                    "reasoning": inner.get("description") or inner.get("name") or inner.get("purpose") or ""
+                }
+
+            # Normalise step fields: "action" → "capability", "id" → step_number placeholder
+            for step in plan.get("steps", []):
+                if "capability" not in step and "action" in step:
+                    step["capability"] = step.pop("action")
+
             # Validate plan structure
             if "steps" not in plan or not isinstance(plan["steps"], list) or len(plan["steps"]) == 0:
                 print(f"   ⚠️  Invalid plan structure - missing or empty steps")
@@ -776,179 +2245,45 @@ Return ONLY the JSON object. No markdown formatting, no code blocks, no explanat
 
 
 def create_intelligent_default_plan(task_description: str, capabilities: List[str]) -> Dict[str, Any]:
-    """Create an intelligent default plan by parsing the task description"""
-    print(f"   Creating intelligent default plan by analyzing task")
-    
-    task_lower = task_description.lower()
-    steps = []
-    step_num = 1
-    
-    # Parse task for keywords and structure
-    # Look for sequential indicators: "then", "and then", "after", "finally"
-    parts = []
-    
-    # Split by common separators
-    for separator in [', then ', ' then ', ', and then ', ' and then ', ', finally ', ' finally ', ', after that ', ' after that ']:
-        if separator in task_lower:
-            parts = task_description.split(separator, 1)
-            if len(parts) == 2:
-                # Recursively split the second part
-                remaining = parts[1]
-                parts = [parts[0]]
-                for sep2 in [', then ', ' then ', ', and then ', ' and then ', ', finally ', ' finally ']:
-                    if sep2 in remaining.lower():
-                        sub_parts = remaining.split(sep2, 1)
-                        parts.extend(sub_parts)
-                        break
-                else:
-                    parts.append(remaining)
-                break
-    
-    # If no explicit separators, look for specific patterns
-    if not parts or len(parts) == 1:
-        # Check for comparison pattern: "Research X and Y and compare"
-        if ("compare" in task_lower or "comparison" in task_lower) and ("research" in task_lower or "analyze" in task_lower):
-            # Extract topics to research
-            if "microservices" in task_lower and "monolithic" in task_lower:
-                parts = [
-                    "Research the benefits of microservices architecture",
-                    "Research monolithic architecture",
-                    "Compare microservices and monolithic architectures",
-                    "Create a detailed comparison report"
-                ]
-            elif " and " in task_description:
-                # Generic pattern: "Research A and B and compare"
-                segments = task_description.split(" and ")
-                if len(segments) >= 2:
-                    for i, seg in enumerate(segments[:-1]):
-                        if i == 0:
-                            parts.append(seg)
-                        else:
-                            parts.append(f"Research {seg}")
-                    if "compare" in segments[-1].lower():
-                        parts.append("Compare the researched concepts")
-                    if "report" in segments[-1].lower():
-                        parts.append("Create a detailed comparison report")
-    
-    # If still no parts, treat as single task
-    if not parts:
-        parts = [task_description]
-    
-    print(f"   Identified {len(parts)} task components:")
-    for i, part in enumerate(parts, 1):
-        print(f"      {i}. {part.strip()}")
-    
-    # Map each part to capabilities
-    for part in parts:
-        part_lower = part.lower().strip()
-        
-        if not part_lower:
-            continue
-        
-        # Determine which capability to use
-        if "compare" in part_lower or "comparison" in part_lower:
-            if "compare_concepts" in capabilities:
-                steps.append({
-                    "step_number": step_num,
-                    "capability": "compare_concepts",
-                    "description": f"Compare concepts based on previous research",
-                    "parameters": {"concept_a": "", "concept_b": ""},  # Will be injected from context
-                    "expected_output": "Comparison of concepts",
-                    "depends_on": list(range(1, step_num)) if step_num > 1 else []
-                })
-                step_num += 1
-        
-        elif "report" in part_lower:
-            if "generate_report" in capabilities:
-                # Extract topic if possible
-                topic = part_lower.replace("create", "").replace("generate", "").replace("report", "").replace("detailed", "").strip()
-                if not topic:
-                    topic = "Summary report based on analysis"
-                    
-                steps.append({
-                    "step_number": step_num,
-                    "capability": "generate_report",
-                    "description": f"Generate comprehensive report",
-                    "parameters": {"topic": topic, "data": ""},  # Data will be injected
-                    "expected_output": "Formatted report",
-                    "depends_on": list(range(1, step_num)) if step_num > 1 else []
-                })
-                step_num += 1
-        
-        elif ("research" in part_lower or "question" in part_lower or "benefits" in part_lower or 
-              "explain" in part_lower or "what" in part_lower or "how" in part_lower):
-            if "answer_question" in capabilities:
-                # Use the original phrasing as the question
-                question = part.strip()
-                if not question.endswith("?"):
-                    question = question + "?"
-                    
-                steps.append({
-                    "step_number": step_num,
-                    "capability": "answer_question",
-                    "description": f"Research and answer: {question[:50]}...",
-                    "parameters": {"question": question},
-                    "expected_output": "Research findings",
-                    "depends_on": []
-                })
-                step_num += 1
-        
-        elif "code" in part_lower or "python" in part_lower:
-            if "analyze_python_code" in capabilities:
-                steps.append({
-                    "step_number": step_num,
-                    "capability": "analyze_python_code",
-                    "description": "Analyze the Python code",
-                    "parameters": {"code": "# Code to be provided"},
-                    "expected_output": "Code analysis",
-                    "depends_on": []
-                })
-                step_num += 1
-            if "explain_code" in capabilities:
-                steps.append({
-                    "step_number": step_num,
-                    "capability": "explain_code",
-                    "description": "Explain how the code works",
-                    "parameters": {},  # Will be injected from previous step
-                    "expected_output": "Code explanation",
-                    "depends_on": [step_num - 1] if step_num > 1 else []
-                })
-                step_num += 1
-        
-        elif "data" in part_lower or "analyze" in part_lower:
-            if "analyze_data" in capabilities:
-                steps.append({
-                    "step_number": step_num,
-                    "capability": "analyze_data",
-                    "description": "Analyze the data",
-                    "parameters": {"data": part},
-                    "expected_output": "Data analysis",
-                    "depends_on": []
-                })
-                step_num += 1
-    
-    # Fallback: If no steps were created, use answer_question as catch-all
-    if not steps and "answer_question" in capabilities:
-        steps.append({
-            "step_number": 1,
-            "capability": "answer_question",
-            "description": "Answer the question",
-            "parameters": {"question": task_description},
-            "expected_output": "Answer",
-            "depends_on": []
-        })
-    
-    print(f"   ✓ Created plan with {len(steps)} steps")
-    
+    """Minimal fallback plan used only when the LLM planner fails entirely.
+
+    Creates a single best-effort step.  Do NOT add keyword-based routing logic
+    here — all routing decisions are the LLM's responsibility, driven by the
+    capability descriptions that each agent registers in the service registry.
+    """
+    print("   ⚠️  LLM planner failed; creating minimal fallback plan")
+    fallback_cap = next(
+        (c for c in ["answer_question", "analyze_data"] if c in capabilities),
+        capabilities[0] if capabilities else "answer_question",
+    )
+    params: Dict[str, Any] = (
+        {"question": task_description}
+        if fallback_cap == "answer_question"
+        else {"data": task_description}
+    )
     return {
-        "steps": steps,
-        "reasoning": "Intelligent default plan created by parsing task structure and identifying sequential operations"
+        "steps": [
+            {
+                "step_number": 1,
+                "capability": fallback_cap,
+                "description": f"Execute: {task_description}",
+                "parameters": params,
+                "expected_output": "Result",
+                "depends_on": [],
+            }
+        ],
+        "reasoning": "Minimal fallback plan — LLM planner unavailable",
     }
 
 
 def create_default_plan(task_description: str, capabilities: List[str]) -> Dict[str, Any]:
-    """Deprecated: Use create_intelligent_default_plan instead"""
+    """Thin compatibility shim — delegates to create_intelligent_default_plan."""
     return create_intelligent_default_plan(task_description, capabilities)
+
+
+# NOTE: _fix_math_routing and the old keyword-matching create_intelligent_default_plan
+# have been removed.  Routing is entirely driven by the LLM using capability
+# descriptions + input_schema from the agent registry.
 
 
 async def generate_reflection(
@@ -956,7 +2291,10 @@ async def generate_reflection(
     plan: Dict[str, Any],
     workflow_context: Dict[str, Any],
     completed_steps: int,
-    total_steps: int
+    total_steps: int,
+    workflow_id: str = None,
+    session_id: str = None,
+    user_id: str = None,
 ) -> Dict[str, Any]:
     """
     Generate reflection on workflow execution using LLM.
@@ -975,9 +2313,21 @@ async def generate_reflection(
             "result_length": len(str(step_data.get("result", "")))
         })
     
-    prompt = f"""You are reflecting on a multi-agent workflow execution.
+    
+    system_instruction = f"""You are reflecting on a multi-agent workflow execution. Analyze the execution and provide a structured reflection.
 
-ORIGINAL TASK:
+Return JSON format:
+{{
+  "summary": "2-3 sentence summary of execution",
+  "success_rate": "{success_rate}",
+  "success_percentage": {success_percentage:.1f},
+  "strengths": ["what worked well"],
+  "weaknesses": ["what didn't work"],
+  "suggestions": ["how to improve"],
+  "overall_assessment": "excellent|good|fair|poor"
+}}"""
+
+    user_context = f"""ORIGINAL TASK:
 {task_description}
 
 EXECUTION PLAN:
@@ -995,26 +2345,17 @@ ANALYZE:
 2. Did steps execute in the right order?
 3. Was context properly shared between steps?
 4. Were any steps unnecessary or missing?
-5. What could be improved?
-
-Provide a brief reflection in JSON format:
-{{
-  "summary": "2-3 sentence summary of execution",
-  "success_rate": "{success_rate}",
-  "success_percentage": {success_percentage:.1f},
-  "strengths": ["what worked well"],
-  "weaknesses": ["what didn't work"],
-  "suggestions": ["how to improve"],
-  "overall_assessment": "excellent|good|fair|poor"
-}}
-
-Return only valid JSON."""
+5. What could be improved?"""
     
     try:
-        response = bedrock_client.converse(
+        response = await _llm_converse(
             modelId=BEDROCK_MODEL_ID,
-            messages=[{"role": "user", "content": [{"text": prompt}]}],
-            inferenceConfig={"maxTokens": 2000, "temperature": 0.5}
+            system=[{"text": system_instruction}],
+            messages=[{"role": "user", "content": [{"text": user_context}]}],
+            inferenceConfig={"maxTokens": 2000, "temperature": 0.5},
+            workflow_id=workflow_id,
+            session_id=session_id,
+            user_id=user_id,
         )
         
         content = response['output']['message']['content'][0]['text']
@@ -1048,9 +2389,10 @@ Return only valid JSON."""
 @app.get("/api/workflow/{workflow_id}")
 async def get_workflow(workflow_id: str):
     """Get workflow status"""
-    if workflow_id not in active_workflows:
+    state = await dist_state.get_workflow_state(workflow_id)
+    if state is None:
         raise HTTPException(status_code=404, detail="Workflow not found")
-    return active_workflows[workflow_id]
+    return state
 
 
 @app.get("/api/agents")
@@ -1069,6 +2411,171 @@ async def list_agents():
             }
             for agent in agents
         ]
+    }
+
+
+@app.websocket("/ws/workflow/{workflow_id}")
+async def websocket_endpoint(websocket: WebSocket, workflow_id: str):
+    """
+    WebSocket endpoint for real-time workflow interaction
+    
+    Enables bidirectional communication:
+    - Client receives real-time updates (step progress, interaction requests, etc.)
+    - Client can send responses to interaction requests
+    - Client can query status and conversation history
+    
+    Message types from server:
+    - connection_established: Welcome message
+    - workflow_status: Current workflow state
+    - step_started: A step has started
+    - step_completed: A step has completed
+    - user_input_required: Agent needs user input
+    - response_received: User response acknowledged
+    - workflow_resuming: Workflow is resuming after user input
+    - workflow_completed: Workflow finished
+    - error: Error occurred
+    - pong: Response to ping
+    
+    Message types from client:
+    - ping: Keep-alive
+    - get_status: Request current workflow status
+    - get_conversation: Request conversation history
+    - user_response: Submit response to interaction request
+      {
+        "type": "user_response",
+        "request_id": "req_123",
+        "response": "user's answer",
+        "additional_context": {} (optional)
+      }
+    - cancel_workflow: Cancel workflow execution
+    """
+    if not ws_handler:
+        await websocket.close(code=1011, reason="WebSocket handler not initialized")
+        return
+
+    # HA: subscribe to pub/sub so this replica receives events published by
+    # whichever replica is currently executing the workflow.
+    await dist_state.subscribe_local_websocket(workflow_id, ws_handler.connection_manager)
+    try:
+        await ws_handler.handle_connection(websocket, workflow_id)
+    finally:
+        await dist_state.pubsub.unsubscribe(workflow_id)
+
+
+@app.post("/api/workflow/{workflow_id}/respond")
+async def respond_to_interaction(workflow_id: str, response: Dict[str, Any]):
+    """
+    REST endpoint for responding to interaction requests (alternative to WebSocket)
+    
+    Request body:
+    {
+        "request_id": "req_123",
+        "response": "user's answer",
+        "additional_context": {} (optional)
+    }
+    """
+    if not ws_handler:
+        raise HTTPException(status_code=503, detail="WebSocket handler not initialized")
+    
+    request_id = response.get("request_id")
+    user_response = response.get("response")
+    additional_context = response.get("additional_context")
+    
+    print(f"\n📨 RECEIVED RESPONSE:")
+    print(f"   Workflow ID: {workflow_id}")
+    print(f"   Request ID: {request_id}")
+    print(f"   Response: {user_response}")
+    
+    if not request_id or user_response is None:
+        raise HTTPException(status_code=400, detail="request_id and response required")
+    
+    # Submit response
+    print(f"   Submitting response to interaction manager...")
+    success = await ws_handler.interaction_manager.submit_response(
+        request_id=request_id,
+        response=user_response,
+        additional_context=additional_context
+    )
+    
+    print(f"   Submit result: {success}")
+    
+    if not success:
+        raise HTTPException(status_code=400, detail="Failed to submit response")
+    
+    # Notify via WebSocket if connected
+    if ws_handler.connection_manager.has_connections(workflow_id):
+        await ws_handler.connection_manager.broadcast_to_workflow(workflow_id, {
+            "type": "response_received",
+            "request_id": request_id,
+            "response": user_response,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    
+    # Resume workflow
+    asyncio.create_task(ws_handler._resume_workflow(workflow_id))
+    
+    return {
+        "success": True,
+        "message": "Response submitted, workflow resuming"
+    }
+
+
+@app.get("/api/workflow/{workflow_id}/status")
+async def get_workflow_status(workflow_id: str):
+    """
+    Get the current status of a workflow
+    
+    Returns:
+    {
+        "workflow_id": "...",
+        "status": "running|paused|completed|failed",
+        "current_step": 2,
+        "total_steps": 5,
+        "pending_interactions": [...],
+        "results": [...]
+    }
+    """
+    from database import WorkflowDatabase
+    
+    if not ws_handler:
+        raise HTTPException(status_code=503, detail="WebSocket handler not initialized")
+    
+    # Try to get workflow from database first
+    db = WorkflowDatabase()
+    workflow = db.get_workflow(workflow_id)
+    
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    
+    # Get pending interaction requests
+    pending = ws_handler.interaction_manager.get_pending_requests(workflow_id)
+    
+    return {
+        "workflow_id": workflow_id,
+        "status": workflow.status.value if isinstance(workflow.status, WorkflowStatus) else workflow.status,
+        "current_step": workflow.current_step,
+        "total_steps": workflow.total_steps,
+        "pending_interactions": pending,
+        "results": workflow.results,
+        "start_time": workflow.started_at.isoformat() if workflow.started_at else None,
+        "last_update": workflow.updated_at.isoformat() if workflow.updated_at else None,
+        "workflow_context": workflow.workflow_context
+    }
+
+
+@app.get("/api/workflow/{workflow_id}/conversation")
+async def get_conversation(workflow_id: str):
+    """Get conversation history for a workflow"""
+    from conversation import ConversationManager
+    from database import WorkflowDatabase
+    
+    db = WorkflowDatabase()
+    conversation_mgr = ConversationManager(db)
+    history = conversation_mgr.get_conversation_history(workflow_id)
+    
+    return {
+        "workflow_id": workflow_id,
+        "conversation": history
     }
 
 

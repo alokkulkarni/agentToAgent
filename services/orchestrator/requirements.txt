@@ -5,3 +5,32 @@ pydantic==2.10.5
 python-dotenv==1.0.1
 boto3==1.35.94
 botocore==1.35.94
+websockets==12.0
+
+# Identity Provider & Authentication
+PyJWT[crypto]>=2.8.0
+cryptography>=41.0.0
+
+# ── HA / Multi-instance distributed state ────────────────────────────────────
+# Redis client for shared workflow state, ownership registry, and WS pub/sub.
+# Required when HA_BACKEND=redis (recommended for multi-replica deployments).
+redis>=5.0.0
+
+# ── Shared workflow DB backend — PostgreSQL ───────────────────────────────────
+# Required when WORKFLOW_DB_BACKEND=postgresql (SQLite is the default).
+# psycopg2-binary bundles libpq so no system packages are needed in Docker.
+psycopg2-binary>=2.9.9
+
+# ── Vector Memory Store — optional cloud backends ─────────────────────────────
+# Install only the backend(s) you intend to use. Core in-memory store and
+# AWS Bedrock embeddings work with zero extra packages (boto3 already above).
+#
+# ChromaDB local/server:        pip install chromadb>=0.4.0
+qdrant-client>=1.7.0
+# Pinecone cloud:               pip install pinecone-client>=3.0.0
+# AWS OpenSearch Service:       pip install opensearch-py>=2.4.0 requests-aws4auth>=1.2.3
+# Azure AI Search:              pip install azure-search-documents>=11.4.0
+# Azure Cosmos DB (DiskANN):    pip install azure-cosmos>=4.5.1
+# Azure passwordless auth:      pip install azure-identity>=1.15.0
+# Local embeddings (offline):   pip install sentence-transformers>=2.6.0
+# OpenAI embeddings:            pip install openai>=1.0.0

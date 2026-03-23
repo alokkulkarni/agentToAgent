@@ -7,7 +7,7 @@ from typing import Callable, Any, Optional
 from datetime import datetime
 import logging
 
-from .models import RetryPolicy, StepRecord, StepStatus
+from models import RetryPolicy, StepRecord, StepStatus
 
 logger = logging.getLogger(__name__)
 

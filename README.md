@@ -1,700 +1,452 @@
-# A2A Multi-Agent System
+# Agent-to-Agent (A2A) Framework
 
-**Agent-to-Agent Communication Framework with LLM-Powered Orchestration**
+A generic, extensible framework for autonomous multi-agent collaboration using **AWS Bedrock** and **Model Context Protocol (MCP)**. This system enables complex workflow orchestration, interactive human-in-the-loop tasks, and enterprise-grade security — built for production deployment from day one.
 
-A distributed multi-agent system that enables autonomous agents to collaborate on complex tasks using LLM-based planning, MCP (Model Context Protocol) for tool integration, and intelligent workflow orchestration.
+## 🌟 Key Features
+
+*   **🤖 Multi-Agent Orchestration**: Intelligent planning and task delegation via a dedicated **Model Gateway** supporting multiple LLM providers and AWS regions. Uses Amazon Nova Pro (default) with automatic fallback and circuit-breaker protection.
+*   **🌐 Real-Time Web Search**: The Research Agent includes a dedicated `search_web` capability that routes live/current-data queries (time, weather, prices, news) to the MCP web-search server — distinct from the `answer_question` LLM-knowledge path.
+*   **🔌 MCP Integration**: Standardized tool integration via the Model Context Protocol.
+*   **🗣️ Interactive Human-in-the-Loop**: First-class support for pausing workflows mid-execution to request user guidance (text, choices, confirmations) and resuming exactly where the workflow left off.
+*   **💾 Context Preservation**: Session-scoped conversation history and thought trails persist across multiple workflows. Supports semantic recall via a pluggable **Vector Memory Store**.
+*   **🏗️ High-Availability Orchestrator**: Multi-replica orchestrator support backed by **Redis** for shared workflow state, ownership leasing, cross-instance WebSocket pub/sub fan-out, and an **instance registry**. Pluggable database backend supports **SQLite** (dev) and **PostgreSQL** (production).
+*   **🔒 Enterprise Security**:
+    *   **Guardrails**: Input/Output filtering for safety and compliance (AWS Bedrock Guardrails).
+    *   **PII Vault**: Automatic tokenization of sensitive data (credit cards, SSN, email) before LLM processing; detokenization only for authorized tools.
+    *   **Audit Logging**: Immutable, cryptographically chained (blockchain-style) WORM-compliant logs of all agent thoughts, plans, observations, and actions.
+    *   **Identity Propagation**: Full user context (`user_id`, `roles`, `scopes`, `tenant_id`) carried through every agent call and tool execution.
+*   **⚡ Performance**: Parallel step execution (dependency-graph-aware), prompt caching, exponential backoff retries with jitter, and mustache template resolution for inter-step data passing.
+*   **🧠 Pluggable Vector Memory**: Long-term semantic agent recall across sessions. Supports 10+ backends: in-memory, ChromaDB, Pinecone, Qdrant, Weaviate, pgvector, Redis, Amazon OpenSearch, Azure AI Search, and Azure Cosmos DB. Supports multiple embedding providers (AWS Bedrock Titan, OpenAI, Sentence Transformers).
+*   **📡 WebSocket Real-Time Interface**: Persistent bidirectional WebSocket connections per workflow for real-time status, thought-trail streaming, and interactive user prompts.
+
+```ascii
+                    +---------------------------+
+                    |    IDENTITY PROVIDER      |
+                    | (Azure AD / Okta / Auth0  |
+                    |  Cognito / Keycloak / OIDC)|
+                    +------------+--------------+
+                                 | JWT Validation /
+                                 | Token Issuance
+      [ USER / CLI / WS ]        |
+            | (Bearer JWT)       |
+            v                    v
+    +------------------+  Validate   +-------------------+
+    |   ORCHESTRATOR   |<----------->|   AUTH MODULE     |
+    |   (Port 8100)    |    Token    | (identity_provider|
+    +--------+---------+             |  .py + JWKS)      |
+             |    |                 +-------------------+
+             |    | WebSocket            |
+             |    | (real-time)     OBO Token Exchange
+             v    v                      |
+    +------------------+  +------------------+
+    |   AGENT MESH     |  |  SECURITY LAYER  |
+    | (Research, Math, |  | (Guardrails/PII/ |
+    |  Code, Data...)  |  |  Audit Logging)  |
+    +--------+---------+  +------------------+
+             |
+    +--------+--------+
+    |  CONTEXT LAYER  |
+    | Vector Memory   |
+    | (Qdrant / Redis |
+    |  OpenSearch...) |
+    +--------+--------+
+             |
+             | (Tool Call + User Token)
+             v
+    +------------------+  Auth Schema  +-------------------+
+    |   MCP GATEWAY    |<------------->|   MCP REGISTRY    |
+    |   (Port 8300)    |  Fetch/Verify | (Tool Auth Reqs)  |
+    +--------+---------+               +-------------------+
+
+    LLM Routing (Orchestrator → Model Gateway → Bedrock):
+    +-------------------------------------------+
+    |          MODEL GATEWAY (Port 8400)        |
+    | Provider routing | Circuit breaker        |
+    | Amazon Nova / Claude | Multi-region        |
+    +-------------------------------------------+
+             |
+             | (Tool-Scoped Token via OBO)
+             v
+    +--------------------------------------+
+    |           MCP SERVERS                |
+    | (Web Search / Calculator / File Ops  |
+    |  Database / Custom Tools...)         |
+    +--------------------------------------+
+
+    HA Shared State (Redis / PostgreSQL):
+    +-------------------------------------------+
+    | Workflow State | Session Store | Ownership |
+    | Pub/Sub Events | Instance Registry         |
+    +-------------------------------------------+
+```
 
 ---
 
 ## 🚀 Quick Start
 
 ### Prerequisites
-- Python 3.11–3.13 **or** Docker + Docker Compose
-- AWS credentials with access to Amazon Bedrock
+*   Python 3.11+
+*   Docker & Docker Compose
+*   AWS Credentials (with Bedrock access enabled)
 
-### Option 1: Shell Script (Local Development)
+### 1. Setup Environment
 ```bash
-# 1. Configure AWS credentials
-aws configure
+# Clone the repository
+git clone https://github.com/alokkulkarni/agentToAgent.git
+cd agentToAgent
 
-# 2. Set up Python virtual environment and install dependencies
-./setup.sh
+# Run initial setup (creates venv, installs dependencies)
+./scripts/setup.sh
 
-# 3. Start all services
-./start_services.sh
+# Configure environment variables
+cp services/orchestrator/.env.example services/orchestrator/.env
+# Edit .env and add your AWS credentials / identity provider settings
+```
 
-# 4. Send a test workflow request
+> **AWS Credentials**: Docker Compose mounts `~/.aws` into containers at `/app/.aws` (not `/root/.aws`).  
+> The env vars `AWS_SHARED_CREDENTIALS_FILE=/app/.aws/credentials` and `AWS_CONFIG_FILE=/app/.aws/config`  
+> are set automatically — no manual credential injection needed.
+
+### 2. Start All Services
+```bash
+# Start everything via Docker Compose (Registry, Redis, Qdrant, Orchestrator,
+# MCP Servers, MCP Gateway, all Agents)
+docker compose up --build
+
+# Or use the helper script for local non-Docker runs
+./scripts/start_services.sh
+```
+
+### 3. Run Interactive Chat (CLI)
+```bash
+python scripts/cli_chat.py
+```
+
+**Example Interaction:**
+> **You**: "Compare the top cloud providers."
+> **Agent**: "I need to know which specific providers you are interested in."
+> **You**: "AWS, Azure, and GCP."
+> **Agent**: *Proceeds with research...*
+
+### 4. Connect via WebSocket (Real-Time)
+```bash
+# Open the built-in WebSocket test client
+open services/orchestrator/websocket_test_client.html
+# Or connect programmatically
+python examples/websocket_interactive_workflow.py
+```
+
+---
+
+## � Real-Time Web Search Routing
+
+The orchestrator planner automatically distinguishes between queries that need **live data** and those that can be answered from **LLM knowledge**:
+
+| Query type | Capability selected | Agent |
+|---|---|---|
+| Current time / today's date | `search_web` | ResearchAgent |
+| Live prices, weather, news | `search_web` | ResearchAgent |
+| Concept explanation, history | `answer_question` | ResearchAgent |
+| Arithmetic / math | `calculate` | MathAgent |
+
+The planner enforces this via a hard routing rule: *any query that asks for real-time or live information must use `search_web`, not `answer_question`*.
+
+### Replacing the Mock Web Search with a Real API
+
+The default web search MCP server (`services/mcp_servers/web_search/app.py`) returns placeholder results. To integrate a real search engine:
+
+```bash
+# services/mcp_servers/web_search/.env
+SEARCH_PROVIDER=brave          # brave | google | bing
+BRAVE_API_KEY=your-key-here    # for Brave Search
+# GOOGLE_API_KEY / GOOGLE_CSE_ID for Google Custom Search
+# BING_API_KEY for Bing
+```
+
+Once set, the `search_web` tool in `app.py` will call the real API instead of returning mock results.
+
+---
+
+## �🗣️ Human-in-the-Loop Workflows
+
+The framework treats human interaction as a first-class concern. At any point during execution, an agent can pause the workflow and ask the user for guidance.
+
+### How It Works
+
+1.  An agent determines it needs human input and returns a structured `user_input_required` response via `shared/agent_interaction.py`.
+2.  The **Interaction Manager** (`orchestrator/interaction.py`) serializes the request to the database and broadcasts it over WebSocket.
+3.  The workflow status transitions to `waiting_for_input`.
+4.  The user responds (via REST API, WebSocket, or CLI).
+5.  The workflow resumes from the paused step with the user's response injected into agent context.
+
+### Supported Input Types
+*   `text` — free-form text answer
+*   `single_choice` — pick one option from a list
+*   `multiple_choice` — pick multiple options
+*   `confirmation` — yes/no approval
+*   `file_upload` — provide a file path
+*   `number` — numeric value
+*   `date` / `rating` / `scale` — specialized input types
+
+### Workflow Status Model
+```
+pending → planning → running → waiting_for_input → input_received → running → completed
+                                                ↓ (timeout)
+                                           input_timeout
+```
+
+---
+
+## 🔒 Enterprise Security Setup
+
+The framework includes a comprehensive security layer. To configure it:
+
+### 1. Guardrails
+The system uses `SafeLLMClient` which wraps standard Bedrock calls.
+*   **Configuration**: Point to a real AWS Bedrock Guardrails ID in `.env` (`GUARDRAIL_ID`).
+*   **Behavior**: Blocks prompts containing malicious patterns or banned topics; filters outputs.
+
+### 2. PII Vault
+Sensitive data is automatically detected and tokenized.
+*   **Detected Types**: Credit card numbers, SSN, email addresses.
+*   **Storage**: Ephemeral in-memory vault (default). Configure Redis for production.
+*   **Usage**: Agents see tokens (e.g., `TOKEN_CC_1`); only authorized tools (like `transfer_funds`) can access real data via the detokenization API.
+
+### 3. Audit Logging
+All actions are logged to `audit_logs/`.
+*   **Format**: JSON-structured logs with cryptographic chaining (hash of previous entry — blockchain-style WORM).
+*   **Content**: `timestamp`, `trace_id`, `actor`, `action`, `thought`, `input`, `output`, `hash`.
+
+### 4. Identity Provider Integration (Enterprise Authentication)
+The framework supports integration with multiple identity providers for JWT-based authentication and authorization.
+
+#### Supported Identity Providers
+*   **Azure AD (Microsoft Entra ID)**
+*   **Okta**
+*   **Auth0**
+*   **AWS Cognito**
+*   **Keycloak**
+*   **Any OIDC-compliant provider**
+
+#### Quick Setup
+```bash
+# 1. Install authentication dependencies
+pip install PyJWT[crypto] cryptography httpx
+
+# 2. Configure your identity provider in .env
+AUTH_ENABLED=true
+AUTH_PROVIDER=azure_ad  # or okta, auth0, cognito, keycloak, oidc
+AUTH_ISSUER=https://login.microsoftonline.com/{tenant-id}/v2.0
+AUTH_AUDIENCE=api://{your-api-client-id}
+AUTH_CLIENT_ID={your-client-id}
+AUTH_CLIENT_SECRET={your-client-secret}
+
+# 3. Test your setup
+python scripts/test_identity_provider.py
+```
+
+#### Features
+*   **JWT Token Validation**: RS256/HS256 signature verification with JWKS auto-discovery
+*   **Role-Based Access Control (RBAC)**: Enforce roles on endpoints
+*   **Scope-Based Access Control**: Fine-grained permissions via OAuth scopes
+*   **On-Behalf-Of (OBO) Token Exchange**: Automatically exchange user tokens for tool-specific tokens
+*   **Token Caching**: Performance optimization with automatic expiry handling
+*   **MCP Tool Authentication**: MCP servers can declare authentication requirements; gateway handles token exchange
+
+#### API Usage
+```bash
+# Get JWT token from your identity provider
+TOKEN=$(curl -X POST https://your-idp.com/oauth2/token \
+  -d grant_type=client_credentials \
+  -d client_id=your-client-id \
+  -d client_secret=your-client-secret \
+  -d scope=api.access | jq -r .access_token)
+
+# Use token to execute workflow
 curl -X POST http://localhost:8100/api/workflow/execute \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"task_description": "Add 25 and 17, then square the result"}'
-
-# 5. Stop all services when done
-./stop_services.sh
+  -d '{"task_description": "Analyze sales data"}'
 ```
 
-### Option 2: Docker Compose (Production-Ready)
+#### Documentation
+*   **[Identity Provider Setup Guide](docs/IDENTITY_PROVIDER_SETUP.md)**: Detailed configuration for each IdP.
+*   **[Identity Integration Summary](docs/IDENTITY_INTEGRATION_SUMMARY.md)**: Architecture and features overview.
+*   **Setup Script**: `./scripts/setup_identity_provider.sh` — Automated setup helper.
+*   **Test Script**: `./scripts/test_identity_provider.py` — Verify your configuration.
+
+#### Development Mode
+For local development, you can disable authentication:
 ```bash
-# 1. Configure AWS credentials (one-time)
-aws configure
-
-# 2. Start all services (automatically uses ~/.aws credentials)
-docker-compose up -d
-
-# 3. Check that all containers are healthy
-docker-compose ps
-
-# 4. Send a test workflow request
-curl -X POST http://localhost:8100/api/workflow/execute \
-  -H "Content-Type: application/json" \
-  -d '{"task_description": "Add 25 and 17, then square the result"}'
-
-# 5. Follow live logs
-docker-compose logs -f orchestrator
-
-# 6. Stop all services when done
-docker-compose down
-```
-
-> **Tip**: No `.env` file is needed for Docker Compose if you have the AWS CLI configured — credentials are mounted from `~/.aws` automatically.
-
----
-
-## ✨ Key Features
-
-### Core Capabilities
-| Feature | Description |
-|---------|-------------|
-| 🤖 **Autonomous Agent Collaboration** | Agents self-register, discover each other, and collaborate without manual wiring |
-| 🧠 **LLM-Powered Workflow Planning** | Claude 3.5 Sonnet (via AWS Bedrock) generates multi-step execution plans from plain-language descriptions |
-| 🔧 **MCP Tool Integration** | Model Context Protocol provides a standardised, extensible way to add new tools |
-| ⚡ **Parallel Step Execution** | Independent workflow steps run concurrently (2–5× faster than sequential) |
-| 🔄 **Automatic Retry with Backoff** | Exponential backoff (1 s → 2 s → 4 s …) with jitter; configurable per-step |
-| 🛡️ **Circuit Breaker Protection** | Automatically opens after 5 consecutive failures; half-open recovery after 60 s |
-| 💾 **Workflow Persistence** | SQLite-backed state allows workflows to be resumed after process restarts or failures |
-| 🔍 **Dynamic Service Discovery** | Agents and MCP servers register at startup; orchestrator queries live capability lists |
-| 📊 **Context Enrichment** | Results from earlier steps are automatically injected into the parameters of later steps |
-
----
-
-## 📋 Overall System Architecture
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                         CLIENT / USER                         │
-└────────────────────────────┬─────────────────────────────────┘
-                             │  POST /api/workflow/execute
-                             ↓
-             ┌───────────────────────────────┐
-             │      Orchestrator (8100)       │
-             │  LLM Planning · Parallel Exec  │
-             │  Retry · Persistence · Context │
-             └───────────────┬───────────────┘
-                             │
-                   ┌─────────┴──────────┐
-                   ↓                    ↓
-     ┌─────────────────────┐  ┌───────────────────┐
-     │   Registry (8000)    │  │  MCP Gateway (8300)│
-     │ Agent Discovery      │  │ Tool Routing       │
-     │ Health Checks        │  │ LLM Tool Selection │
-     └──────────┬───────────┘  └────────┬──────────┘
-                │                       │
-        ┌───────┴──────┐        ┌───────┴──────────┐
-        ↓              ↓        ↓                   ↓
-  ┌──────────┐  ┌──────────┐  ┌──────────────┐  ┌──────────┐
-  │  Agents  │  │  Agents  │  │ MCP Registry │  │ MCP Tools│
-  │ 8001-006 │  │ (cont.)  │  │    (8200)    │  │ 8210-213 │
-  └──────────┘  └──────────┘  └──────────────┘  └──────────┘
-```
-
-### Service Startup Order
-Services must start in the following dependency order (handled automatically by both shell scripts and Docker Compose):
-
-1. **Registry** (8000) — must be ready first
-2. **MCP Registry** (8200) — parallel with Orchestrator
-3. **Orchestrator** (8100) — depends on Registry
-4. **MCP Tool Servers** (8210–8213) — depend on MCP Registry
-5. **MCP Gateway** (8300) — depends on all MCP tool servers
-6. **Agents** (8001–8006) — depend on Registry (Math Agent also depends on MCP Gateway)
-
----
-
-## 📊 Service Reference
-
-### Core Services
-
-| Service | Port | Description |
-|---------|------|-------------|
-| Registry | 8000 | Central agent discovery, heartbeat monitoring, capability indexing |
-| Orchestrator | 8100 | LLM-based workflow planning, parallel/sequential execution, persistence |
-
-### MCP Services
-
-| Service | Port | Description |
-|---------|------|-------------|
-| MCP Registry | 8200 | MCP server and tool discovery, server health tracking |
-| MCP Gateway | 8300 | Routes tool calls to the correct MCP server; optional LLM tool selection |
-
-### Agent Services
-
-| Agent | Port | Capabilities |
-|-------|------|-------------|
-| Code Analyzer | 8001 | `analyze_python_code`, `explain_code`, `suggest_improvements` |
-| Data Processor | 8002 | `transform_data`, `analyze_data`, `summarize_data` |
-| Research Agent | 8003 | `answer_question`, `generate_report`, `compare_concepts` |
-| Task Executor | 8004 | `execute_command`, `file_operations`, `wait_task` |
-| Observer | 8005 | `system_monitoring`, `event_logging`, `metrics_reporting`, `agent_statistics` |
-| Math Agent | 8006 | `calculate`, `advanced_math`, `solve_equation`, `statistics` |
-
-### MCP Tool Servers
-
-| Server | Port | Tools |
-|--------|------|-------|
-| File Operations | 8210 | `read_file`, `write_file`, `list_files`, `search_files` |
-| Database | 8211 | `query`, `insert`, `update`, `delete`, `create_table` |
-| Web Search | 8212 | `search`, `fetch_url` |
-| Calculator | 8213 | `add`, `subtract`, `multiply`, `divide`, `power`, `square`, `sqrt`, `abs` |
-
----
-
-## 🔎 Individual Service Details
-
-### Registry Service (Port 8000)
-
-Central hub for agent self-registration and discovery.
-
-**Features**
-- Agents register on startup and send a heartbeat every 30 s
-- Stale agents (no heartbeat for 60 s) are automatically removed
-- In-memory indexes by capability name and agent role
-- Supports role-based and capability-based lookups
-
-**API**
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Health check |
-| `POST` | `/api/registry/register` | Register an agent |
-| `DELETE` | `/api/registry/unregister/{agent_id}` | Unregister an agent |
-| `POST` | `/api/registry/heartbeat/{agent_id}` | Refresh agent heartbeat |
-| `GET` | `/api/registry/agents` | List all registered agents |
-| `GET` | `/api/registry/agents/{agent_id}` | Get a specific agent |
-| `GET` | `/api/registry/discover` | Discover agents by `?capability=` or `?role=` |
-| `GET` | `/api/registry/capabilities` | List all capabilities and their agents |
-| `GET` | `/api/registry/stats` | Registry statistics |
-
----
-
-### Orchestrator Service (Port 8100)
-
-Receives plain-language task descriptions, plans multi-step workflows using Claude 3.5 Sonnet, dispatches steps to agents, and aggregates results.
-
-**Features**
-- **Workflow phases**: DISCOVER → PLAN (LLM) → EXECUTE → VERIFY → REFLECT
-- **Parallel execution**: steps with no inter-dependencies run concurrently (up to `MAX_PARALLEL_STEPS`)
-- **Context enrichment**: results from completed steps are automatically substituted into placeholder parameters of later steps
-- **Retry**: per-step exponential backoff with configurable `max_retries`
-- **Circuit breaker**: per-agent; opens after 5 failures, enters half-open recovery after 60 s
-- **Persistence**: every workflow and step is saved to SQLite; failed workflows can be resumed
-
-**API**
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api/workflow/execute` | Start a new workflow |
-| `GET` | `/api/workflow/{workflow_id}` | Get workflow status and results |
-| `GET` | `/api/workflows` | List all workflows (with optional status filter) |
-| `POST` | `/api/workflow/{workflow_id}/resume` | Resume a failed or paused workflow |
-| `GET` | `/health` | Health check |
-
-**Request body for `/api/workflow/execute`**
-```json
-{
-  "task_description": "Add 25 and 17, then square the result"
-}
+# In .env
+AUTH_ENABLED=false
 ```
 
 ---
 
-### MCP Registry (Port 8200)
+## 🏗️ High-Availability Configuration
 
-Discovery service for MCP tool servers.
+The orchestrator supports multi-replica deployment with shared state via Redis and PostgreSQL.
 
-**Features**
-- MCP servers self-register with their list of tools and `base_url`
-- Tools are indexed by name for fast lookup
-- Supports filtering servers by status
-
-**API**
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/` | Health check |
-| `POST` | `/api/mcp/register` | Register an MCP server |
-| `DELETE` | `/api/mcp/unregister/{server_id}` | Unregister a server |
-| `PUT` | `/api/mcp/heartbeat/{server_id}` | Update server heartbeat |
-| `GET` | `/api/mcp/servers` | List all registered MCP servers |
-| `GET` | `/api/mcp/servers/{server_id}` | Get a specific server |
-| `GET` | `/api/mcp/tools` | List all tools across all servers |
-| `GET` | `/api/mcp/tools/{tool_name}` | Find servers that provide a specific tool |
-| `GET` | `/api/mcp/discovery` | Full discovery (servers + tool summary) |
-
----
-
-### MCP Gateway (Port 8300)
-
-Routes tool execution requests to the correct MCP server. Optionally uses Claude 3.5 Sonnet to intelligently select tools from a natural-language query.
-
-**Features**
-- Direct tool execution by name: `POST /api/gateway/execute`
-- Natural-language query processing with LLM tool selection: `POST /api/gateway/query`
-- Prefers a specific server when `prefer_server` is supplied
-- Falls back to the first available active server
-
-**API**
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/` | Health check |
-| `POST` | `/api/gateway/execute` | Execute a named tool directly |
-| `POST` | `/api/gateway/query` | Process a natural-language query (LLM selects and executes tools) |
-| `GET` | `/api/gateway/tools` | List all available tools |
-| `GET` | `/api/gateway/discovery` | Full discovery from MCP Registry |
-
-**Execute a tool directly**
-```json
-POST /api/gateway/execute
-{
-  "tool_name": "add",
-  "parameters": { "a": 25, "b": 17 }
-}
+### Distributed State (Redis)
+```bash
+# In services/orchestrator/.env
+HA_BACKEND=redis
+REDIS_URL=redis://redis:6379
+ORCHESTRATOR_INSTANCE_ID=orchestrator-1
+ORCHESTRATOR_PUBLIC_ENDPOINT=http://orchestrator-1:8100
+WORKFLOW_STATE_TTL=86400
 ```
 
-**Natural-language query**
-```json
-POST /api/gateway/query
-{
-  "query": "What is 25 plus 17?",
-  "context": {},
-  "auto_execute": true
-}
+Shared capabilities:
+*   **Workflow state** — active workflows readable by any replica
+*   **Session store** — session history shared across instances
+*   **Ownership leasing** — only one replica executes a given workflow at a time (prevents duplicate execution)
+*   **Pub/Sub fan-out** — WebSocket events broadcast to all replicas so any connected client receives updates
+
+### Pluggable Database Backend
+```bash
+# SQLite (default — single-node development)
+WORKFLOW_DB_BACKEND=sqlite
+SQLITE_DB_PATH=/app/data/workflows.db
+
+# PostgreSQL (recommended for production HA)
+WORKFLOW_DB_BACKEND=postgresql
+DATABASE_URL=postgresql://user:pass@postgres:5432/orchestrator
 ```
 
 ---
 
-### Code Analyzer Agent (Port 8001)
+## 🧠 Vector Memory (Long-Term Recall)
 
-Analyzes Python code using both AST-based static analysis and Claude 3.5 Sonnet.
-
-| Capability | LLM | Description |
-|-----------|-----|-------------|
-| `analyze_python_code` | No | Static AST analysis of code structure |
-| `explain_code` | Yes | Plain-English explanation of what code does |
-| `suggest_improvements` | Yes | Recommendations for code quality improvements |
-
-**Task request example**
-```json
-POST /api/task
-{
-  "capability": "analyze_python_code",
-  "parameters": { "code": "def hello(): return 'world'" }
-}
-```
-
----
-
-### Data Processor Agent (Port 8002)
-
-Processes and analyses structured data using Claude 3.5 Sonnet.
-
-| Capability | LLM | Description |
-|-----------|-----|-------------|
-| `transform_data` | No | Convert data between formats (JSON, CSV, etc.) |
-| `analyze_data` | Yes | Extract insights and patterns from data |
-| `summarize_data` | Yes | Produce a concise summary of a dataset |
-
----
-
-### Research Agent (Port 8003)
-
-Answers questions and generates reports using Claude 3.5 Sonnet as its knowledge base.
-
-| Capability | LLM | Description |
-|-----------|-----|-------------|
-| `answer_question` | Yes | Answer a factual or analytical question |
-| `generate_report` | Yes | Produce a structured, detailed report on a topic |
-| `compare_concepts` | Yes | Compare and contrast two or more concepts |
-
----
-
-### Task Executor Agent (Port 8004)
-
-General-purpose worker for lightweight automation tasks.
-
-| Capability | LLM | Description |
-|-----------|-----|-------------|
-| `execute_command` | No | Execute a system command (sandboxed/simulated) |
-| `file_operations` | No | Read or write files |
-| `wait_task` | No | Wait for a specified duration (useful for testing pipelines) |
-
----
-
-### Observer Agent (Port 8005)
-
-Collects and reports system-level metrics and events. Does **not** require an LLM.
-
-| Capability | LLM | Description |
-|-----------|-----|-------------|
-| `system_monitoring` | No | Monitor system activity and track agent metrics |
-| `event_logging` | No | Log and retrieve system-level events |
-| `metrics_reporting` | No | Produce a metrics report (latency, success rates, etc.) |
-| `agent_statistics` | No | Return statistics about registered agents |
-
----
-
-### Math Agent (Port 8006)
-
-Performs mathematical operations by delegating to the MCP Calculator server via the MCP Gateway. Does **not** require an LLM.
-
-| Capability | LLM | Description |
-|-----------|-----|-------------|
-| `calculate` | No | Basic arithmetic: `add`, `subtract`, `multiply`, `divide` |
-| `advanced_math` | No | Advanced operations: `square`, `sqrt`, `power` |
-| `solve_equation` | No | Solve simple equations |
-| `statistics` | No | Statistical measures: `mean`, `median`, `sum` over a list of numbers |
-
----
-
-### MCP Calculator Server (Port 8213)
-
-Provides pure-Python mathematical computations. No LLM required.
-
-| Tool | Parameters | Description |
-|------|-----------|-------------|
-| `add` | `a`, `b` | Addition |
-| `subtract` | `a`, `b` | Subtraction |
-| `multiply` | `a`, `b` | Multiplication |
-| `divide` | `a`, `b` | Division (raises error if `b == 0`) |
-| `power` | `base`, `exponent` | Exponentiation |
-| `square` | `value` | Square a number |
-| `sqrt` | `value` | Square root (non-negative only) |
-| `abs` | `value` | Absolute value |
-
----
-
-### MCP Database Server (Port 8211)
-
-SQLite-backed database with pre-seeded sample tables (`users`, `products`).
-
-| Tool | Description |
-|------|-------------|
-| `query` | Execute a SELECT statement |
-| `insert` | Insert a row into a table |
-| `update` | Update rows matching a condition |
-| `delete` | Delete rows matching a condition |
-| `create_table` | Create a new table |
-
----
-
-### MCP File Operations Server (Port 8210)
-
-Sandboxed file system operations within a configurable workspace directory.
-
-| Tool | Description |
-|------|-------------|
-| `read_file` | Read the contents of a file |
-| `write_file` | Write content to a file |
-| `list_files` | List files in a directory |
-| `search_files` | Search for files matching a pattern |
-
----
-
-### MCP Web Search Server (Port 8212)
-
-Simulated web search and URL fetching (mock implementation; replace with a real search API for production).
-
-| Tool | Description |
-|------|-------------|
-| `search` | Return search results for a query |
-| `fetch_url` | Fetch and return the content of a URL |
-
----
-
-## 🚀 Running the System
-
-### Shell Script Deployment (Local)
+Agents can store and semantically retrieve memories across sessions.
 
 ```bash
-# Step 1 — Install dependencies (one-time)
-./setup.sh
-
-# Step 2 — Export AWS credentials (or use `aws configure` beforehand)
-export AWS_ACCESS_KEY_ID="your_access_key"
-export AWS_SECRET_ACCESS_KEY="your_secret_key"
-export AWS_REGION="us-east-1"
-
-# Step 3 — Start all 14 services (Registry, Orchestrator, MCP stack, 6 agents)
-./start_services.sh
-
-# Step 4 — Verify services are running
-curl http://localhost:8000/health    # Registry
-curl http://localhost:8100/health    # Orchestrator
-curl http://localhost:8200/          # MCP Registry
-curl http://localhost:8300/          # MCP Gateway
-
-# Step 5 — Stop all services
-./stop_services.sh
+# Enable in .env
+VECTOR_MEMORY_ENABLED=true
+VECTOR_MEMORY_BACKEND=qdrant        # qdrant is included in docker-compose
+VECTOR_MEMORY_EMBEDDING=bedrock     # uses AWS Titan Embeddings
+VECTOR_MEMORY_COLLECTION=a2a_memories
+VECTOR_MEMORY_TOP_K=5
+VECTOR_MEMORY_SCORE_THRESHOLD=0.3
 ```
 
-The `start_services.sh` script:
-1. Creates and activates a Python virtual environment
-2. Installs dependencies for every service
-3. Starts all services in the correct dependency order
-4. Prints all service URLs on success
+**Supported Backends**: `in_memory`, `chromadb`, `pinecone`, `qdrant`, `weaviate`, `pgvector`, `redis`, `opensearch_aws`, `azure_ai_search`, `azure_cosmos`
 
-### Docker Compose Deployment
-
-```bash
-# Build and start all containers
-docker-compose up -d
-
-# Check container status
-docker-compose ps
-
-# Tail logs for a specific service
-docker-compose logs -f orchestrator
-docker-compose logs -f math-agent
-
-# Rebuild after code changes
-docker-compose build --no-cache
-docker-compose up -d
-
-# Stop and remove containers
-docker-compose down
-
-# Stop and remove containers + persistent volumes
-docker-compose down -v
-```
-
-Docker Compose starts services in the correct dependency order (health-checks ensure the Registry and MCP Registry are ready before dependent services start). AWS credentials are mounted read-only from `~/.aws`.
-
-### Environment Variables
-
-```bash
-# Required — AWS Bedrock access
-AWS_ACCESS_KEY_ID=your_key
-AWS_SECRET_ACCESS_KEY=your_secret
-AWS_REGION=us-east-1
-BEDROCK_MODEL_ID=anthropic.claude-3-5-sonnet-20241022-v2:0
-
-# Optional — Workflow behaviour
-MAX_RETRIES=3                 # Per-step retry limit
-MAX_PARALLEL_STEPS=5          # Concurrent step limit
-HEARTBEAT_INTERVAL=30         # Agent heartbeat frequency (seconds)
-HEARTBEAT_TIMEOUT=60          # Time before stale agent is removed (seconds)
-LOG_LEVEL=INFO                # Logging verbosity
-```
-
-Copy `.env.example` to `.env` and fill in your values, or export them as shell variables.
-
----
-
-## 💡 Example Workflows
-
-### Multi-Step Math Calculation
-```bash
-curl -X POST http://localhost:8100/api/workflow/execute \
-  -H "Content-Type: application/json" \
-  -d '{"task_description": "Add 25 and 17, then square the result"}'
-# Executes: add(25,17)=42 → square(42)=1764
-```
-
-### Research and Analysis Pipeline
-```bash
-curl -X POST http://localhost:8100/api/workflow/execute \
-  -H "Content-Type: application/json" \
-  -d '{"task_description": "Research cloud computing adoption trends, then analyze the data and generate a report"}'
-# Executes: answer_question → analyze_data → generate_report
-```
-
-### Code Quality Review
-```bash
-curl -X POST http://localhost:8100/api/workflow/execute \
-  -H "Content-Type: application/json" \
-  -d '{"task_description": "Analyze this Python function and suggest improvements: def calc(x): return x*x"}'
-# Executes: analyze_python_code → suggest_improvements
-```
-
-### Direct MCP Tool Call
-```bash
-# Call the calculator directly through the MCP Gateway (no LLM planning needed)
-curl -X POST http://localhost:8300/api/gateway/execute \
-  -H "Content-Type: application/json" \
-  -d '{"tool_name": "multiply", "parameters": {"a": 6, "b": 7}}'
-```
-
-### Registry Inspection
-```bash
-# List all registered agents
-curl http://localhost:8000/api/registry/agents | jq .
-
-# Find agents that can perform a specific capability
-curl "http://localhost:8000/api/registry/discover?capability=calculate" | jq .
-
-# List all available MCP tools
-curl http://localhost:8200/api/mcp/tools | jq .
-```
-
----
-
-## 🧪 Testing
-
-### Run the Full Integration Test Suite
-```bash
-# Requires running services
-source venv/bin/activate
-python test_distributed_system.py
-```
-
-### Run MCP-Specific Tests
-```bash
-python test_mcp_math_agent.py
-python test_workflow_detailed.py
-```
-
-See [TESTING_GUIDE.md](TESTING_GUIDE.md) for expected output, troubleshooting steps, and a description of each test case.
-
----
-
-## 🎯 Use Cases
-
-| Use Case | Agents Involved |
-|----------|----------------|
-| Automated Research & Reporting | Research Agent → Data Processor → Research Agent |
-| Code Quality Assessment | Code Analyzer → Code Analyzer |
-| Multi-Step Calculations | Math Agent (× N steps) |
-| Data Transformation Pipeline | Data Processor (× N steps) |
-| Database Query + Analysis | Math Agent / Task Executor + Data Processor |
-
----
-
-## 🔒 Security
-
-- AWS credentials are passed via environment variables or IAM roles (never hard-coded)
-- Docker volumes mount `~/.aws` as read-only
-- MCP tool servers sandbox file operations inside a configurable workspace directory
-- Agent heartbeat timeout prevents zombie registrations
-- Workflow and step timeouts prevent resource exhaustion
-
----
-
-## 📈 Performance
-
-| Feature | Impact |
-|---------|--------|
-| Parallel Execution | 2–5× speedup for independent workflow steps |
-| Exponential Backoff | Handles transient failures without overloading agents |
-| Circuit Breaker | Stops sending requests to a failing agent, reducing blast radius |
-| SQLite Persistence | < 5% overhead; enables cross-restart workflow resumption |
-| Connection Pooling | `httpx.AsyncClient` reused across calls per service |
-
----
-
-## 🛠️ Technology Stack
-
-| Component | Technology |
-|-----------|-----------|
-| Language | Python 3.11–3.13 |
-| Web Framework | FastAPI + Uvicorn |
-| HTTP Client | httpx (async) |
-| LLM | AWS Bedrock — Claude 3.5 Sonnet |
-| Tool Protocol | MCP (Model Context Protocol) |
-| Workflow DB | SQLite |
-| Containerisation | Docker + Docker Compose |
-| Async Runtime | asyncio |
-
----
-
-## 📝 Project Structure
-
-```
-agentToAgent/
-├── services/
-│   ├── registry/             # Agent registry service
-│   ├── orchestrator/         # Workflow orchestrator (+ models, database, retry, executor)
-│   ├── mcp_registry/         # MCP tool registry service
-│   ├── mcp_gateway/          # MCP gateway / router
-│   ├── agents/
-│   │   ├── code_analyzer/    # Python code analysis agent
-│   │   ├── data_processor/   # Data processing agent
-│   │   ├── research_agent/   # Research & report agent
-│   │   ├── task_executor/    # General task execution agent
-│   │   ├── observer/         # System monitoring agent
-│   │   └── math_agent/       # Mathematical operations agent
-│   └── mcp_servers/
-│       ├── calculator/       # MCP calculator tool server
-│       ├── database/         # MCP SQLite database server
-│       ├── file_ops/         # MCP file operations server
-│       └── web_search/       # MCP web search server
-├── shared/
-│   └── a2a_protocol/         # Shared Pydantic models and HTTP client
-├── tests/                    # Test suite
-├── docs/                     # Additional documentation
-├── docker-compose.yml        # Container orchestration
-├── setup.sh                  # One-time environment setup
-├── start_services.sh         # Start all services (local)
-├── stop_services.sh          # Stop all services (local)
-└── .env.example              # Environment variable template
-```
-
-### Adding New Agents
-
-1. Create a directory under `services/agents/<agent_name>/`
-2. Implement `app.py` using `shared.a2a_protocol` models
-3. Register capabilities with the Registry on startup (see any existing agent for the pattern)
-4. Add a `Dockerfile` and entry in `docker-compose.yml`
-5. Add the startup command to `start_services.sh`
-
-### Adding New MCP Tools
-
-1. Create a directory under `services/mcp_servers/<tool_name>/`
-2. Implement `app.py` — expose `/api/tools/execute` and `/api/mcp/tools` endpoints
-3. Register with the MCP Registry on startup
-4. Add a `Dockerfile` and entry in `docker-compose.yml`
+**Supported Embedding Providers**: `bedrock` (Titan), `openai`, `sentence_transformers`, `none`
 
 ---
 
 ## 📚 Documentation
 
-| Document | Description |
-|----------|-------------|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Detailed system architecture, component design, data-flow diagrams |
-| [QUICK_START.md](QUICK_START.md) | Quick-reference command guide |
-| [DOCKER_DEPLOYMENT.md](DOCKER_DEPLOYMENT.md) | Docker Compose deployment guide |
-| [AWS_CREDENTIALS_GUIDE.md](AWS_CREDENTIALS_GUIDE.md) | AWS credential configuration and IAM best practices |
-| [DEPLOYMENT_COMPARISON.md](DEPLOYMENT_COMPARISON.md) | Shell-script vs Docker — trade-offs and recommendations |
-| [TESTING_GUIDE.md](TESTING_GUIDE.md) | Test procedures, expected outputs, and troubleshooting |
-| [CURL_EXAMPLES.md](CURL_EXAMPLES.md) | Ready-to-run API examples for all services |
-| [MCP_CURL_EXAMPLES.md](MCP_CURL_EXAMPLES.md) | MCP-specific API examples |
-| [ENHANCEMENTS_COMPLETE.md](ENHANCEMENTS_COMPLETE.md) | Feature guide: persistence, retry, and parallel execution |
-| [DOCUMENTATION.md](DOCUMENTATION.md) | Documentation index (organised by role and topic) |
+*   **[ARCHITECTURE.md](docs/ARCHITECTURE.md)**: Detailed system design, HA architecture, security flows, and component interaction.
+*   **[DEPLOYMENT_SUMMARY.md](docs/DEPLOYMENT_SUMMARY.md)**: Central hub for all deployment guides.
+*   **[AWS Deployment](docs/DEPLOYMENT_AWS.md)**: Deployment on ECS Fargate, EKS, and EC2.
+*   **[Azure Deployment](docs/DEPLOYMENT_AZURE.md)**: Deployment on ACA, AKS, and VMs.
+*   **[General Deployment](docs/DEPLOYMENT.md)**: Local Docker Compose setup.
+*   **[Testing Guide](docs/TESTING_GUIDE.md)**: Test suite overview and how to run tests.
+*   **[Interactive Workflow Examples](docs/INTERACTIVE_WORKFLOW_EXAMPLES.md)**: Human-in-the-loop usage examples.
 
 ---
 
-## 🤝 Contributing
+## 🛠️ Service Architecture
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/my-new-agent`)
-3. Make your changes and add tests
-4. Submit a pull request
+### Orchestrator (Port 8100) — The "Brain"
+*   **Workflow Planning**: Decomposes tasks into dependency-ordered steps using Claude 3.5 Sonnet.
+*   **Parallel Execution**: Executes independent steps concurrently via a dependency-graph-aware `ParallelExecutor` with configurable concurrency (`max_parallel_steps`).
+*   **Context Enrichment**: Auto-resolves `{{step_id.result}}` mustache templates to pass outputs from earlier steps into later steps.
+*   **Retry Engine**: Per-step exponential backoff with jitter; configurable `max_retries`, `retriable_errors`.
+*   **Conversation Manager**: Persists per-workflow `ConversationMessage` and `ThoughtTrailEntry` records.
+*   **Interaction Manager**: Suspends/resumes workflows for human-in-the-loop input with configurable timeouts.
+*   **WebSocket Handler**: `ConnectionManager` maintains per-workflow WebSocket fan-out; broadcasts status, thoughts, and interaction requests in real time.
+
+### Agent Mesh
+
+| Agent | Port | Capabilities |
+|---|---|---|
+| Code Analyzer | 8001 | `analyze_python_code`, `explain_code`, `suggest_improvements`, `detect_bugs` |
+| Data Processor | 8002 | `transform_data`, `analyze_data`, `summarize_data` |
+| Research Agent | 8003 | `search_web` *(real-time/live data)*, `answer_question` *(LLM knowledge)*, `generate_report`, `compare_concepts` |
+| Task Executor | 8004 | `execute_command`, `file_operations`, `wait_task` |
+| Observer | 8005 | `system_monitoring`, `event_logging`, `metrics_reporting`, `agent_statistics` |
+| Math Agent | 8006 | `calculate`, `advanced_math`, `solve_equation`, `statistics` |
+
+### MCP Servers (The "Hands")
+
+| Server | Port | Tools |
+|---|---|---|
+| File Ops | 8210 | `read_file`, `write_file`, `list_files` |
+| Database | 8211 | `query_database`, `execute_sql` |
+| Web Search | 8212 | `search_web` — returns live search results (mock by default; swap with Brave/Google API) |
+| Calculator | 8213 | `calculate` |
+
+### Infrastructure Services
+
+| Service | Port | Purpose |
+|---|---|---|
+| Agent Registry | 8000 | Agent discovery, heartbeat, health |
+| MCP Registry | 8200 | Tool catalog, auth schemas |
+| MCP Gateway | 8300 | JWT validation, OBO exchange, tool routing |
+| Model Gateway | 8400 | LLM provider routing, circuit breaker, multi-region Bedrock support |
+| Redis | 6379 | HA shared state, pub/sub, session store |
+| Qdrant | 6333 | Vector memory store |
+
+### Model Gateway (Port 8400)
+
+The Model Gateway decouples LLM provider selection from agent code. The orchestrator sends all planning requests through the gateway, which handles:
+
+*   **Provider routing** — Bedrock (default), with hookpoints for Azure OpenAI, OpenAI, and other providers.
+*   **Circuit breaker** — Opens automatically after repeated `ValidationException` / 5xx errors; resets on recovery.
+*   **Health probe** — Periodic lightweight inference call (configurable model) to gate the circuit state.
+*   **Multi-region awareness** — Amazon Nova models are available in all AWS regions. Claude models require `us-east-1`; the gateway enforces this at routing time.
+
+#### Key Environment Variables
+
+```bash
+# services/model_gateway/.env  (or docker-compose environment)
+BEDROCK_REGION=eu-west-2                         # AWS region for Bedrock calls
+BEDROCK_HEALTH_PROBE_MODEL=amazon.nova-micro-v1:0  # Lightweight model for health checks
+
+# services/orchestrator/.env
+LLM_PROVIDER=model_gateway                        # Route all LLM calls through the gateway
+MODEL_GATEWAY_URL=http://model-gateway:8400
+# Use a Nova model when deploying in non-us-east-1 regions (Claude unavailable there)
+MODEL_GATEWAY_PREFERRED_MODEL=amazon.nova-pro-v1:0
+```
+
+> **Region note**: If you are running in `us-east-1` you may set `MODEL_GATEWAY_PREFERRED_MODEL=anthropic.claude-3-5-sonnet-20241022-v2:0`. For any other region use an Amazon Nova model (e.g. `amazon.nova-pro-v1:0`).
 
 ---
 
-## 📄 License
+## 🧪 Testing
 
-[Add your license here]
+```bash
+# Run core test suite
+python -m pytest tests/
+
+# Interactive workflow tests
+python scripts/test_interactive_complete.py
+python scripts/test_websocket_interactive.py
+
+# Identity provider tests
+python scripts/test_identity_provider.py
+
+# MCP math agent tests
+python scripts/test_mcp_math_agent.py
+
+# Full distributed system test
+python scripts/test_distributed_system.py
+```
 
 ---
 
-**Version**: 2.1  
-**Last Updated**: 2026-03-23  
-**Status**: Production Ready ✅
+**Version**: 3.1
+**Last Updated**: 2026-03-20
+
+### Recent Changes (v3.1)
+- **Model Gateway** (port 8400): New LLM routing service with circuit breaker, health probe, and multi-region Bedrock support.
+- **Amazon Nova model support**: `MODEL_GATEWAY_PREFERRED_MODEL=amazon.nova-pro-v1:0` enables deployment in all AWS regions, not just `us-east-1`.
+- **`search_web` capability** on ResearchAgent: Dedicated routing path for real-time/live queries via the MCP web-search server.
+- **Smart planner routing rule**: Orchestrator planner enforces mandatory `search_web` selection for any time/date/live-data query.
+- **AWS credential mount fix**: Credentials now mounted to `/app/.aws` (previously `/root/.aws`, which was inaccessible to the container user).
+- **Health probe model fix**: Model Gateway health check uses `amazon.nova-micro-v1:0` (configurable via `BEDROCK_HEALTH_PROBE_MODEL`).

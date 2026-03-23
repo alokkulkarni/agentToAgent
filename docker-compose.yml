@@ -1,104 +1,180 @@
 version: '3.8'
 
 services:
-  # Registry Service - Central agent registry (FIRST)
+
+  # ---------------------------------------------------------------------------
+  # Registry Service — central agent registry (starts first)
+  # ---------------------------------------------------------------------------
   registry:
     build:
       context: .
       dockerfile: services/registry/Dockerfile
+    env_file: services/registry/.env
     ports:
       - "8000:8000"
-    environment:
-      - REGISTRY_HOST=0.0.0.0
-      - REGISTRY_PORT=8000
-      - HEARTBEAT_TIMEOUT=60
     networks:
       - a2a-network
+    restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 15s
 
-  # MCP Registry - MCP server registry (SECOND - parallel with Orchestrator)
+  # ---------------------------------------------------------------------------
+  # MCP Registry — MCP server registry
+  # ---------------------------------------------------------------------------
   mcp-registry:
     build:
       context: .
       dockerfile: services/mcp_registry/Dockerfile
+    env_file: services/mcp_registry/.env
     ports:
       - "8200:8200"
-    environment:
-      - MCP_REGISTRY_HOST=0.0.0.0
-      - MCP_REGISTRY_PORT=8200
-      - LOG_LEVEL=info
     depends_on:
       registry:
         condition: service_healthy
     networks:
       - a2a-network
+    restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8200/"]
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8200/')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # Qdrant — vector memory store for long-term agent recall
+  # Used by the orchestrator when VECTOR_MEMORY_BACKEND=qdrant
+  # ---------------------------------------------------------------------------
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    networks:
+      - a2a-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Redis — shared state backend for HA multi-instance orchestrator
+  # Set HA_BACKEND=redis in services/orchestrator/.env to activate
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - a2a-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  # Orchestrator Service (SECOND - parallel with MCP Registry)
+  # ---------------------------------------------------------------------------
+  # Orchestrator Service
+  # ---------------------------------------------------------------------------
   orchestrator:
     build:
       context: .
       dockerfile: services/orchestrator/Dockerfile
+    env_file: services/orchestrator/.env
     ports:
       - "8100:8100"
-    environment:
-      - ORCHESTRATOR_NAME=MainOrchestrator
-      - ORCHESTRATOR_PORT=8100
-      - REGISTRY_URL=http://registry:8000
-      # AWS credentials - will use mounted credentials if env vars not set
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
-      - AWS_REGION=${AWS_REGION:-us-east-1}
-      - AWS_PROFILE=${AWS_PROFILE:-default}
-      - BEDROCK_MODEL_ID=${BEDROCK_MODEL_ID:-anthropic.claude-3-5-sonnet-20241022-v2:0}
     volumes:
-      # Mount AWS credentials from host (optional - for local development)
       - ${HOME}/.aws:/root/.aws:ro
+      - workflow-data:/app/data
+    depends_on:
+      registry:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    networks:
+      - a2a-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8100/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Model Gateway — multi-provider LLM facade (port 8400)
+  # Provides: intelligent model selection, transparent fallback,
+  # circuit breakers, and full audit trail across all LLM providers.
+  # ---------------------------------------------------------------------------
+  model-gateway:
+    build:
+      context: .
+      dockerfile: services/model_gateway/Dockerfile
+    env_file: services/model_gateway/.env
+    ports:
+      - "8400:8400"
+    environment:
+      # The container runs as a non-root user (UID 1001). /root is mode 700
+      # so boto3 cannot traverse into /root/.aws. Mount credentials into /app
+      # instead — /app is owned by UID 1001 (see Dockerfile chown -R 1001:0 /app).
+      - AWS_SHARED_CREDENTIALS_FILE=/app/.aws/credentials
+      - AWS_CONFIG_FILE=/app/.aws/config
+    volumes:
+      - ${HOME}/.aws:/app/.aws:ro
+      - model-gateway-audit:/app/audit_logs
     depends_on:
       registry:
         condition: service_healthy
     networks:
       - a2a-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8400/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
 
-  # MCP Servers (THIRD - after MCP Registry)
-  
-  # Calculator MCP Server
+  # MCP Servers (after MCP Registry)
+  # ---------------------------------------------------------------------------
+
   calculator-server:
     build:
       context: .
       dockerfile: services/mcp_servers/calculator/Dockerfile
+    env_file: services/mcp_servers/calculator/.env
     ports:
       - "8213:8213"
-    environment:
-      - MCP_SERVER_NAME=CalculatorServer
-      - MCP_SERVER_PORT=8213
-      - MCP_REGISTRY_URL=http://mcp-registry:8200
     depends_on:
       mcp-registry:
         condition: service_healthy
     networks:
       - a2a-network
+    restart: unless-stopped
 
-  # Database MCP Server
   database-server:
     build:
       context: .
       dockerfile: services/mcp_servers/database/Dockerfile
+    env_file: services/mcp_servers/database/.env
     ports:
       - "8211:8211"
-    environment:
-      - MCP_SERVER_NAME=DatabaseQueryServer
-      - MCP_SERVER_PORT=8211
-      - MCP_REGISTRY_URL=http://mcp-registry:8200
-      - DATABASE_PATH=/tmp/mcp_database.db
     depends_on:
       mcp-registry:
         condition: service_healthy
@@ -106,19 +182,15 @@ services:
       - a2a-network
     volumes:
       - database-data:/tmp
+    restart: unless-stopped
 
-  # File Operations MCP Server
   file-ops-server:
     build:
       context: .
       dockerfile: services/mcp_servers/file_ops/Dockerfile
+    env_file: services/mcp_servers/file_ops/.env
     ports:
       - "8210:8210"
-    environment:
-      - MCP_SERVER_NAME=FileOperationsServer
-      - MCP_SERVER_PORT=8210
-      - MCP_REGISTRY_URL=http://mcp-registry:8200
-      - WORKSPACE_PATH=/tmp/mcp_workspace
     depends_on:
       mcp-registry:
         condition: service_healthy
@@ -126,44 +198,33 @@ services:
       - a2a-network
     volumes:
       - workspace-data:/tmp/mcp_workspace
+    restart: unless-stopped
 
-  # Web Search MCP Server
   web-search-server:
     build:
       context: .
       dockerfile: services/mcp_servers/web_search/Dockerfile
+    env_file: services/mcp_servers/web_search/.env
     ports:
       - "8212:8212"
-    environment:
-      - MCP_SERVER_NAME=WebSearchServer
-      - MCP_SERVER_PORT=8212
-      - MCP_REGISTRY_URL=http://mcp-registry:8200
     depends_on:
       mcp-registry:
         condition: service_healthy
     networks:
       - a2a-network
+    restart: unless-stopped
 
-  # MCP Gateway (FOURTH - after all MCP Servers)
+  # ---------------------------------------------------------------------------
+  # MCP Gateway (after all MCP servers)
+  # ---------------------------------------------------------------------------
   mcp-gateway:
     build:
       context: .
       dockerfile: services/mcp_gateway/Dockerfile
+    env_file: services/mcp_gateway/.env
     ports:
       - "8300:8300"
-    environment:
-      - MCP_GATEWAY_HOST=0.0.0.0
-      - MCP_GATEWAY_PORT=8300
-      - MCP_REGISTRY_URL=http://mcp-registry:8200
-      # AWS credentials - will use mounted credentials if env vars not set
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
-      - AWS_REGION=${AWS_REGION:-us-east-1}
-      - AWS_PROFILE=${AWS_PROFILE:-default}
-      - BEDROCK_MODEL_ID=${BEDROCK_MODEL_ID:-anthropic.claude-3-5-sonnet-20241022-v2:0}
-      - LOG_LEVEL=info
     volumes:
-      # Mount AWS credentials from host (optional - for local development)
       - ${HOME}/.aws:/root/.aws:ro
     depends_on:
       - mcp-registry
@@ -173,134 +234,101 @@ services:
       - web-search-server
     networks:
       - a2a-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8300/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
 
-  # Agent Services (FIFTH - after Registry and MCP Gateway)
+  # ---------------------------------------------------------------------------
+  # Agent Services (after Registry + MCP Gateway)
+  # ---------------------------------------------------------------------------
 
-  # Code Analyzer Agent
   code-analyzer:
     build:
       context: .
       dockerfile: services/agents/code_analyzer/Dockerfile
+    env_file: services/agents/code_analyzer/.env
     ports:
       - "8001:8001"
-    environment:
-      - AGENT_NAME=CodeAnalyzer
-      - AGENT_PORT=8001
-      - REGISTRY_URL=http://registry:8000
-      # AWS credentials - will use mounted credentials if env vars not set
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
-      - AWS_REGION=${AWS_REGION:-us-east-1}
-      - AWS_PROFILE=${AWS_PROFILE:-default}
-      - BEDROCK_MODEL_ID=${BEDROCK_MODEL_ID:-anthropic.claude-3-5-sonnet-20241022-v2:0}
     volumes:
-      # Mount AWS credentials from host (optional - for local development)
       - ${HOME}/.aws:/root/.aws:ro
     depends_on:
       registry:
         condition: service_healthy
     networks:
       - a2a-network
+    restart: unless-stopped
 
-  # Data Processor Agent
   data-processor:
     build:
       context: .
       dockerfile: services/agents/data_processor/Dockerfile
+    env_file: services/agents/data_processor/.env
     ports:
       - "8002:8002"
-    environment:
-      - AGENT_NAME=DataProcessor
-      - AGENT_PORT=8002
-      - REGISTRY_URL=http://registry:8000
-      # AWS credentials - will use mounted credentials if env vars not set
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
-      - AWS_REGION=${AWS_REGION:-us-east-1}
-      - AWS_PROFILE=${AWS_PROFILE:-default}
-      - BEDROCK_MODEL_ID=${BEDROCK_MODEL_ID:-anthropic.claude-3-5-sonnet-20241022-v2:0}
     volumes:
-      # Mount AWS credentials from host (optional - for local development)
       - ${HOME}/.aws:/root/.aws:ro
     depends_on:
       registry:
         condition: service_healthy
     networks:
       - a2a-network
+    restart: unless-stopped
 
-  # Research Agent
   research-agent:
     build:
       context: .
       dockerfile: services/agents/research_agent/Dockerfile
+    env_file: services/agents/research_agent/.env
     ports:
       - "8003:8003"
-    environment:
-      - AGENT_NAME=ResearchAgent
-      - AGENT_PORT=8003
-      - REGISTRY_URL=http://registry:8000
-      # AWS credentials - will use mounted credentials if env vars not set
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
-      - AWS_REGION=${AWS_REGION:-us-east-1}
-      - AWS_PROFILE=${AWS_PROFILE:-default}
-      - BEDROCK_MODEL_ID=${BEDROCK_MODEL_ID:-anthropic.claude-3-5-sonnet-20241022-v2:0}
     volumes:
-      # Mount AWS credentials from host (optional - for local development)
       - ${HOME}/.aws:/root/.aws:ro
     depends_on:
       registry:
         condition: service_healthy
     networks:
       - a2a-network
+    restart: unless-stopped
 
-  # Task Executor Agent
   task-executor:
     build:
       context: .
       dockerfile: services/agents/task_executor/Dockerfile
+    env_file: services/agents/task_executor/.env
     ports:
       - "8004:8004"
-    environment:
-      - AGENT_NAME=TaskExecutor
-      - AGENT_PORT=8004
-      - REGISTRY_URL=http://registry:8000
     depends_on:
       registry:
         condition: service_healthy
     networks:
       - a2a-network
+    restart: unless-stopped
 
-  # Observer Agent
   observer:
     build:
       context: .
       dockerfile: services/agents/observer/Dockerfile
+    env_file: services/agents/observer/.env
     ports:
       - "8005:8005"
-    environment:
-      - AGENT_NAME=Observer
-      - AGENT_PORT=8005
-      - REGISTRY_URL=http://registry:8000
     depends_on:
       registry:
         condition: service_healthy
     networks:
       - a2a-network
+    restart: unless-stopped
 
-  # Math Agent (uses MCP Gateway)
   math-agent:
     build:
       context: .
       dockerfile: services/agents/math_agent/Dockerfile
+    env_file: services/agents/math_agent/.env
     ports:
       - "8006:8006"
-    environment:
-      - AGENT_NAME=MathAgent
-      - AGENT_PORT=8006
-      - REGISTRY_URL=http://registry:8000
-      - MCP_GATEWAY_URL=http://mcp-gateway:8300
-      - LOG_LEVEL=INFO
     depends_on:
       registry:
         condition: service_healthy
@@ -308,6 +336,7 @@ services:
         condition: service_started
     networks:
       - a2a-network
+    restart: unless-stopped
 
 networks:
   a2a-network:
@@ -315,4 +344,14 @@ networks:
 
 volumes:
   database-data:
+    driver: local
   workspace-data:
+    driver: local
+  workflow-data:
+    driver: local
+  redis-data:
+    driver: local
+  qdrant-data:
+    driver: local
+  model-gateway-audit:
+    driver: local
