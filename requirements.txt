@@ -10,7 +10,7 @@ botocore==1.35.94
 aioboto3==13.3.0
 
 # Configuration
-python-dotenv==1.0.1
+python-dotenv==1.2.2
 
 # Identity Provider & Authentication
 PyJWT[crypto]>=2.8.0
@@ -35,7 +35,7 @@ psycopg2-binary>=2.9.9
 
 # Development
 mypy==1.14.0
-pytest==8.3.4
+pytest==9.0.3
 pytest-asyncio==0.25.2
 pytest-cov==6.0.0
 black==26.3.1
